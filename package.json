@@ -1,0 +1,16 @@
+{
+  "name": "sync-music-rooms",
+  "version": "1.0.0",
+  "description": "Listen to music together in sync — create or join a room by code and play MP3 / YouTube links in perfect sync.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  }
+}
