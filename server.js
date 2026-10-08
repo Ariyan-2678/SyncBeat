@@ -219,6 +219,122 @@ const rid = () =>
 // answered an unbounded number of requests — a free oracle for enumerating
 // room codes that bypassed the rate limiter below entirely. Removed.
 
+// ---------------------------------------------------------- uploads
+// Links keep working exactly as before, but finding a host that permits
+// hotlinking is a chore — so a file can be sent straight to the server and
+// played back from there. Everything else (seeking, sync, persistence) is
+// unchanged because an upload is just another audio URL.
+const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
+try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch (e) { /* exists */ }
+const UPLOAD_EXT = new Set(['mp3', 'm4a', 'm4b', 'aac', 'ogg', 'oga', 'opus', 'wav', 'flac', 'weba']);
+const EXT_BY_MIME = {
+  'audio/mpeg': 'mp3', 'audio/mp3': 'mp3',
+  'audio/mp4': 'm4a', 'audio/x-m4a': 'm4a', 'audio/aac': 'aac',
+  'audio/ogg': 'ogg', 'audio/opus': 'opus', 'audio/webm': 'weba',
+  'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/flac': 'flac',
+};
+const MAX_UPLOAD_BYTES = parseInt(process.env.MAX_UPLOAD_MB || '30', 10) * 1024 * 1024;
+const MAX_UPLOAD_TOTAL = parseInt(process.env.MAX_UPLOAD_TOTAL_MB || '512', 10) * 1024 * 1024;
+const UPLOAD_TTL_MS = 24 * 3600 * 1000;
+// An upload is addressed as /uploads/<32 hex>.<ext>. Nothing else is ever
+// accepted, so the path cannot be walked out of the uploads directory.
+const UPLOAD_PATH_RE = /^\/uploads\/[a-f0-9]{32}\.[a-z0-9]{2,5}$/;
+let uploadBytesUsed = 0;
+(function measureUploads() {
+  try {
+    for (const f of fs.readdirSync(UPLOAD_DIR)) {
+      try { uploadBytesUsed += fs.statSync(path.join(UPLOAD_DIR, f)).size; } catch (e) { /* raced */ }
+    }
+  } catch (e) { /* no dir yet */ }
+})();
+
+function uploadExtOf(nameHeader, contentType) {
+  const type = String(contentType || '').toLowerCase().split(';')[0].trim();
+  let name = '';
+  try { name = decodeURIComponent(String(nameHeader || '')).trim(); } catch (e) { name = ''; }
+  // Browsers label .m4a / .oga inconsistently, so the extension wins when the
+  // content-type at least agrees this is audio.
+  if (type && type !== 'application/octet-stream' &&
+      type.indexOf('audio/') !== 0 && type !== 'video/mp4') return null;
+  const m = /\.([A-Za-z0-9]{2,5})$/.exec(name);
+  const fromName = m && UPLOAD_EXT.has(m[1].toLowerCase()) ? m[1].toLowerCase() : null;
+  return fromName || EXT_BY_MIME[type] || null;
+}
+
+// Range requests come free with express.static, so seeking works unchanged.
+app.use('/uploads', express.static(UPLOAD_DIR, { index: false, maxAge: '1h' }));
+
+app.post('/api/upload',
+  // Checks that must run before the body is buffered.
+  (req, res, next) => {
+    // The same gate as the socket. WebSocket had no CORS to lean on and
+    // neither does a plain POST that a foreign page can fire blind.
+    if (!originAllowed(req)) return res.status(403).json({ ok: false, error: 'origin' });
+    const key = rateKeyOf({ headers: req.headers, address: req.socket.remoteAddress });
+    if (!rateOk('upload:' + key, 20, 3600000)) {
+      return res.status(429).json({ ok: false, error: 'rate-limited' });
+    }
+    const len = parseInt(req.headers['content-length'] || '', 10);
+    if (!len) return res.status(411).json({ ok: false, error: 'empty' });
+    if (len > MAX_UPLOAD_BYTES) return res.status(413).json({ ok: false, error: 'too-large' });
+    next();
+  },
+  express.raw({ type: '*/*', limit: MAX_UPLOAD_BYTES }),
+  (req, res) => {
+    const buf = req.body;
+    if (!Buffer.isBuffer(buf) || !buf.length) return res.status(400).json({ ok: false, error: 'empty' });
+    const ext = uploadExtOf(req.headers['x-filename'], req.headers['content-type']);
+    if (!ext) return res.status(415).json({ ok: false, error: 'bad-type' });
+    if (uploadBytesUsed + buf.length > MAX_UPLOAD_TOTAL) {
+      return res.status(507).json({ ok: false, error: 'storage-full' });
+    }
+    const id = crypto.randomBytes(16).toString('hex');
+    try { fs.writeFileSync(path.join(UPLOAD_DIR, id + '.' + ext), buf); } catch (e) {
+      console.error('upload failed:', e.message);
+      return res.status(500).json({ ok: false, error: 'write-failed' });
+    }
+    uploadBytesUsed += buf.length;
+    let name = '';
+    try { name = decodeURIComponent(String(req.headers['x-filename'] || '')); } catch (e) { name = ''; }
+    res.json({ ok: true, path: '/uploads/' + id + '.' + ext, title: cleanTitle(name.replace(/\.[^.]+$/, ''), 'آپلود') });
+  });
+
+// Files nobody points at any more — their room expired, or the track was
+// removed — would otherwise sit on the disk forever.
+function referencedUploads() {
+  const used = new Set();
+  for (const r of Object.values(rooms)) {
+    [r.track].concat(r.queue || [], r.history || []).forEach((t) => {
+      if (t && typeof t.url === 'string' && UPLOAD_PATH_RE.test(t.url)) used.add(t.url.slice(8));
+    });
+  }
+  return used;
+}
+function sweepUploads() {
+  let files;
+  try { files = fs.readdirSync(UPLOAD_DIR); } catch (e) { return 0; }
+  if (!files.length) return 0;
+  const used = referencedUploads();
+  const cutoff = Date.now() - UPLOAD_TTL_MS;
+  let dropped = 0;
+  for (const f of files) {
+    if (used.has(f)) continue;
+    const full = path.join(UPLOAD_DIR, f);
+    try {
+      const st = fs.statSync(full);
+      if (!st.isFile() || st.mtimeMs > cutoff) continue;
+      fs.unlinkSync(full);
+      uploadBytesUsed = Math.max(0, uploadBytesUsed - st.size);
+      dropped++;
+    } catch (e) { /* raced with another pass */ }
+  }
+  return dropped;
+}
+setInterval(() => {
+  const dropped = sweepUploads();
+  if (dropped) console.log('swept uploads:', dropped);
+}, 60 * 60 * 1000).unref();
+
 // ---------------------------------------------------------- rooms
 // rooms[code] = {
 //   hostId: uid|null, hostToken (secret, only to holder), banned[guestId],
@@ -350,6 +466,10 @@ function validTrackInput(input) {
   if (!url || url.length > 2048) return null;
   if (type === 'youtube') {
     if (!/^[\w-]{11}$/.test(url)) return null;
+  } else if (type === 'audio' && UPLOAD_PATH_RE.test(url)) {
+    // One of our own uploads. The path is fully server-generated so it cannot
+    // escape the uploads directory, but the file still has to be there.
+    if (!fs.existsSync(path.join(UPLOAD_DIR, url.slice(8)))) return null;
   } else if (!/^https?:\/\//i.test(url)) return null;
   return { type, url };
 }
@@ -1027,6 +1147,17 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     if (joinedCode) leaveRoom(socket, joinedCode);
   });
+});
+
+// express.raw() refuses a body over its limit; answer it in the same JSON
+// shape the rest of /api/upload uses rather than Express's HTML error page.
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  if (err && err.type === 'entity.too.large') {
+    return res.status(413).json({ ok: false, error: 'too-large' });
+  }
+  console.error(err);
+  res.status(500).json({ ok: false, error: 'server-error' });
 });
 
 const PORT = process.env.PORT || 3000;

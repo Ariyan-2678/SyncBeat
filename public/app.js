@@ -17,6 +17,7 @@ const djBadge = $('djBadge'), djRow = $('djRow'), djCheck = $('djCheck');
 const clearQueueBtn = $('clearQueueBtn');
 const inviteBox = $('inviteBox'), inviteLink = $('inviteLink'), qrImg = $('qrImg');
 const trackUrl = $('trackUrl'), loadBtn = $('loadBtn');
+const uploadBtn = $('uploadBtn'), trackFile = $('trackFile');
 const emptyMsg = $('empty'), trackMeta = $('trackMeta'), trackTitle = $('trackTitle'), trackBy = $('trackBy');
 const audio = $('audio'), ytWrap = $('ytWrap'), scWrap = $('scWrap');
 const transport = $('transport'), playPauseBtn = $('playPauseBtn'), nextBtn = $('nextBtn');
@@ -286,6 +287,63 @@ function doJoin(code, asListener) {
 joinForm.addEventListener('submit', (e) => { e.preventDefault(); joinBtn.click(); });
 trackForm.addEventListener('submit', (e) => { e.preventDefault(); loadBtn.click(); });
 
+// ============================================================ upload from disk
+// Links still work, but finding a host that permits hotlinking is a chore —
+// so the file can go straight to the server and be played back from there.
+// Once it is on the server it is just another audio URL, so seeking, sync
+// and persistence all keep working untouched.
+const MAX_UPLOAD_BYTES = 30 * 1024 * 1024;
+uploadBtn.onclick = () => {
+  if (!canControlClient()) {
+    setStatus(myRole === 'listener' ? 'شنونده نمی‌تواند آهنگ اضافه کند 🎧' : 'فعلاً فقط DJ کنترل می‌کند');
+    return;
+  }
+  trackFile.click();
+};
+trackFile.addEventListener('change', () => {
+  const f = trackFile.files && trackFile.files[0];
+  trackFile.value = ''; // so picking the same file twice still fires
+  if (f) uploadFile(f);
+});
+function uploadFile(file) {
+  if (!socket) return;
+  if (!canControlClient()) {
+    setStatus(myRole === 'listener' ? 'شنونده نمی‌تواند آهنگ اضافه کند 🎧' : 'فعلاً فقط DJ کنترل می‌کند');
+    return;
+  }
+  if (file.size > MAX_UPLOAD_BYTES) { setStatus('حجم فایل باید کمتر از ۳۰ مگابایت باشه'); return; }
+  const looksLikeAudio = /^audio\//i.test(file.type) ||
+    /\.(mp3|m4a|m4b|aac|ogg|oga|opus|wav|flac|weba)$/i.test(file.name || '');
+  if (!looksLikeAudio) { setStatus('فقط فایل صوتی قبول می‌شه'); return; }
+
+  const finish = (msg) => { uploadBtn.disabled = false; setStatus(msg); };
+  uploadBtn.disabled = true;
+  setStatus('در حال آپلود… ۰٪');
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/upload');
+  xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+  xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name || 'audio'));
+  xhr.upload.onprogress = (e) => {
+    if (e.lengthComputable) setStatus('در حال آپلود… ' + Math.round((e.loaded / e.total) * 100) + '٪');
+  };
+  xhr.onload = () => {
+    let res = null;
+    try { res = JSON.parse(xhr.responseText); } catch (e) { /* not JSON */ }
+    if (xhr.status !== 200 || !res || !res.ok) {
+      finish(res && res.error === 'too-large' ? 'حجم فایل باید کمتر از ۳۰ مگابایت باشه'
+        : res && res.error === 'storage-full' ? 'فضای آپلود پُره — کمی بعد دوباره امتحان کن'
+        : res && res.error === 'rate-limited' ? 'خیلی سریع آپلود می‌کنی — کمی صبر کن'
+        : 'آپلود انجام نشد');
+      return;
+    }
+    socket.emit('queue-add', { type: 'audio', url: res.path, title: res.title }, (r) => {
+      finish(r && r.ok ? 'به صف اضافه شد ✓' : 'خطا در افزودن به صف');
+    });
+  };
+  xhr.onerror = () => finish('آپلود انجام نشد');
+  xhr.send(file);
+}
+
 function onEnteredRoom(res) {
   currentCode = res.code;
   if (ME) ME.uid = res.uid || null;
@@ -332,7 +390,7 @@ function resetRoomUI() {
   djRow.classList.add('hidden');
   clearQueueBtn.classList.add('hidden');
   djCheck.checked = false;
-  trackUrl.disabled = false; loadBtn.disabled = false;
+  trackUrl.disabled = false; loadBtn.disabled = false; uploadBtn.disabled = false;
   trackUrl.value = '';
   setPlayingUI(false);
 }
@@ -512,6 +570,7 @@ function paintMembers(members, dj) {
   const canControlNow = myRole !== 'listener' && (!djOnly || amHost);
   trackUrl.disabled = !canControlNow;
   loadBtn.disabled = !canControlNow;
+  uploadBtn.disabled = !canControlNow;
   djRow.classList.toggle('hidden', !amHost);
   clearQueueBtn.classList.toggle('hidden', !amHost);
   if (amHost) djCheck.checked = djOnly;

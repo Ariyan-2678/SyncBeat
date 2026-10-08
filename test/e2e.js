@@ -49,17 +49,24 @@ function shutdown(code) {
   process.exit(code);
 }
 
-function rawGet(pathAndQuery, headers) {
+// A plain HTTP request that also hands back the body and headers — uploads
+// need to verify what actually comes back off the disk.
+function httpRequest(method, p, headers, body) {
   return new Promise((res, rej) => {
-    const req = http.get(
-      BASE + pathAndQuery,
-      { headers },
-      (r) => { r.resume(); res(r.statusCode); }
-    );
+    const h = Object.assign({}, headers);
+    if (body) h['Content-Length'] = Buffer.byteLength(body);
+    const req = http.request(BASE + p, { method, headers: h }, (r) => {
+      const chunks = [];
+      r.on('data', (c) => chunks.push(c));
+      r.on('end', () => res({ status: r.statusCode, headers: r.headers, body: Buffer.concat(chunks) }));
+    });
     req.on('error', rej);
-    req.setTimeout(4000, () => req.destroy(new Error('raw timeout')));
+    req.setTimeout(8000, () => req.destroy(new Error('http timeout: ' + p)));
+    if (body) req.write(body);
+    req.end();
   });
 }
+const rawGet = (p, headers) => httpRequest('GET', p, headers).then((r) => r.status);
 const rawHandshake = (headers) =>
   rawGet('/socket.io/?EIO=4&transport=polling', headers);
 
@@ -69,7 +76,9 @@ function startServer(env, script) {
     cwd: ROOT,
     env: {
       ...process.env, PORT: String(PORT), HOST_GRACE_MS: '900',
-      SB_DATA_DIR: dataDir, TRUST_PROXY: '0', ...(env || {}),
+      SB_DATA_DIR: dataDir, TRUST_PROXY: '0',
+      // small on purpose so the oversize-upload check stays cheap
+      MAX_UPLOAD_MB: '1', ...(env || {}),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -453,6 +462,65 @@ async function waitRunning(srv, label) {
   ok('SoundCloud pins the room speed (the widget has no rate control)');
   O2.emit('leave-room');
   await sleep(200);
+
+  // ---- uploading a file instead of pasting a link ----
+  const audioBytes = Buffer.concat([Buffer.from('ID3'), Buffer.alloc(512, 3)]);
+  const up = await httpRequest('POST', '/api/upload',
+    { 'Content-Type': 'audio/mpeg', 'X-Filename': encodeURIComponent('برنامه من.mp3') }, audioBytes);
+  let upJson = null;
+  try { upJson = JSON.parse(up.body.toString('utf8')); } catch (e) { /* not json */ }
+  if (up.status !== 200 || !upJson || !upJson.ok) fail('upload rejected: ' + up.status + ' ' + up.body);
+  else if (!/^\/uploads\/[a-f0-9]{32}\.mp3$/.test(upJson.path || '')) fail('upload path is not server-shaped: ' + upJson.path);
+  else if (upJson.title !== 'برنامه من') fail('upload title wrong: ' + upJson.title);
+  const fetched = await httpRequest('GET', upJson.path, {});
+  if (fetched.status !== 200 || Buffer.compare(fetched.body, audioBytes) !== 0) {
+    fail('uploaded file not served back: ' + fetched.status + ' ' + fetched.body.length);
+  }
+  if (!/^audio\//.test(fetched.headers['content-type'] || '')) {
+    fail('upload served with wrong type: ' + fetched.headers['content-type']);
+  }
+  const ranged = await httpRequest('GET', upJson.path, { Range: 'bytes=0-9' });
+  if (ranged.status !== 206 || ranged.body.length !== 10) {
+    fail('upload does not support Range, so seeking would break: ' + ranged.status);
+  }
+  const unknown = await httpRequest('GET', '/uploads/' + 'a'.repeat(32) + '.mp3', {});
+  if (unknown.status !== 404) fail('a missing upload should 404, got ' + unknown.status);
+
+  const U = client({ guestId: 'guestU0013', displayName: 'Umid' });
+  await once(U, 'connect');
+  const uc = await emitAck(U, 'create-room', {});
+  if (!uc || !uc.ok) fail('upload setup create: ' + JSON.stringify(uc));
+  const queued = await emitAck(U, 'queue-add', { type: 'audio', url: upJson.path, title: upJson.title });
+  if (!queued || !queued.ok) fail('queue-add refused an upload: ' + JSON.stringify(queued));
+  const ghosted = await emitAck(U, 'queue-add', { type: 'audio', url: '/uploads/' + 'b'.repeat(32) + '.mp3', title: 'Ghost' });
+  if (!ghosted || ghosted.ok !== false || ghosted.error !== 'bad-track') {
+    fail('queue-add accepted an upload that does not exist: ' + JSON.stringify(ghosted));
+  }
+  const walked = await emitAck(U, 'queue-add', { type: 'audio', url: '/uploads/../../server.js', title: 'Walk' });
+  if (!walked || walked.ok !== false) fail('queue-add accepted a traversal: ' + JSON.stringify(walked));
+  ok('upload: served back, seekable, and only real files reach the queue');
+  U.emit('leave-room');
+  await sleep(200);
+
+  const badType = await httpRequest('POST', '/api/upload',
+    { 'Content-Type': 'text/plain', 'X-Filename': 'notes.txt' }, Buffer.from('hi'));
+  if (badType.status !== 415) fail('a non-audio upload should be 415, got ' + badType.status);
+  const foreign = await httpRequest('POST', '/api/upload',
+    { 'Content-Type': 'audio/mpeg', 'X-Filename': 'x.mp3', Origin: 'http://evil.example' }, audioBytes);
+  if (foreign.status !== 403) fail('a foreign origin should not be able to fill our disk, got ' + foreign.status);
+  const tooBig = await httpRequest('POST', '/api/upload',
+    { 'Content-Type': 'audio/mpeg', 'X-Filename': 'big.mp3' }, Buffer.alloc(1024 * 1024 + 512));
+  if (tooBig.status !== 413) fail('an oversize upload should be 413, got ' + tooBig.status);
+  ok('upload refuses non-audio, foreign origins and oversize bodies');
+
+  let uploadLimited = false;
+  for (let i = 0; i < 25 && !uploadLimited; i++) {
+    const r = await httpRequest('POST', '/api/upload',
+      { 'Content-Type': 'audio/mpeg', 'X-Filename': 'n' + i + '.mp3' }, Buffer.from('x'));
+    if (r.status === 429) uploadLimited = true;
+  }
+  if (!uploadLimited) fail('upload rate limit never fired');
+  ok('upload rate limit (20/hour/IP)');
 
   // ---- rate limit keyed per forwarded client when TRUST_PROXY=1 ----
   // its own data dir: two processes must never race on the same rooms.json

@@ -245,6 +245,17 @@ html[data-theme="light"] .panel::before { background: linear-gradient(90deg, tra
 
 .hidden { display: none !important; }
 
+/* Kept in the DOM and focusable by the button that opens it, but off-screen */
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; margin: -1px;
+  padding: 0; overflow: hidden; clip: rect(0 0 0 0);
+  white-space: nowrap; border: 0;
+}
+
+.chip-btn:disabled, .btn:disabled {
+  opacity: .45; cursor: default; pointer-events: none;
+}
+
 /* Entrance */
 .rise-in { animation: rise-in .7s var(--ease) both; }
 @keyframes rise-in {

@@ -141,8 +141,12 @@
       </div>
 
       <form id="trackForm" class="track-input" autocomplete="off">
-        <input id="trackUrl" dir="ltr" placeholder="لینک آهنگ (MP3 / یوتیوب / ساندکلاد)…" aria-label="لینک آهنگ" />
+        <input id="trackUrl" dir="ltr" placeholder="لینک آهنگ (MP3 / یوتیوب / ساندکلاد) یا فایل از کامپیوتر…" aria-label="لینک آهنگ" />
         <button id="loadBtn" class="btn primary" type="button">▶ پخش</button>
+        <button id="uploadBtn" class="chip-btn" type="button" title="آپلود فایل صوتی از کامپیوتر">📁 آپلود</button>
+        <input id="trackFile" type="file" class="visually-hidden"
+               accept="audio/*,.mp3,.m4a,.m4b,.aac,.ogg,.oga,.opus,.wav,.flac,.weba"
+               aria-label="انتخاب فایل صوتی" />
       </form>
 
       <div id="playerWrap" class="player-wrap">
