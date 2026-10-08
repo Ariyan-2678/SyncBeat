@@ -34,6 +34,40 @@ const io = new Server(server, {
 
 // brute-force guard for create/join (room codes are guessable): 30
 // attempts / minute / IP.
+//
+// Behind a reverse proxy (Render/Railway/nginx) req.socket.remoteAddress is
+// the proxy's own address, so keying on it would give EVERY visitor one
+// shared bucket — 30 attempts/minute for the whole site. Opt in with
+// TRUST_PROXY=1 and we read the client out of the forwarded headers instead.
+// It stays opt-in on purpose: with no proxy in front, a client can forge
+// X-Forwarded-For and mint itself a fresh bucket per request.
+const TRUST_PROXY = /^(1|true|yes|on)$/i.test(process.env.TRUST_PROXY || '');
+function firstHeader(v) {
+  if (Array.isArray(v)) v = v[0];
+  if (typeof v !== 'string') return '';
+  // X-Real-IP is a single value; if a proxy ever comma-joins it, the first
+  // entry is the client that proxy saw.
+  return v.split(',')[0].trim();
+}
+function lastHeader(v) {
+  if (Array.isArray(v)) v = v[0];
+  if (typeof v !== 'string') return '';
+  const parts = v.split(',').map((s) => s.trim()).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : '';
+}
+function rateKeyOf(handshake) {
+  const h = (handshake && handshake.headers) || {};
+  if (TRUST_PROXY) {
+    // A proxy APPENDS the peer it accepted the connection from, so the
+    // rightmost entry is the one added by our own edge and a value forged
+    // by the client sits further left, ignored. This is the same "trust one
+    // hop" rule Express uses for `trust proxy: 1`; set it only when exactly
+    // one proxy stands between the internet and this process.
+    const k = lastHeader(h['x-forwarded-for']) || firstHeader(h['x-real-ip']);
+    if (k) return k;
+  }
+  return handshake && handshake.address;
+}
 const rateHits = new Map();
 function rateOk(key, limit, windowMs) {
   const now = Date.now();
@@ -132,12 +166,10 @@ function validGuestId(id) {
 const rid = () =>
   Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
-app.get('/api/room/:code', (req, res) => {
-  const code = (req.params.code || '').toUpperCase().trim();
-  const r = rooms[code];
-  if (!r) return res.json({ ok: true, exists: false });
-  res.json({ ok: true, exists: true, users: liveMemberCount(r) });
-});
+// NOTE: there used to be a GET /api/room/:code here reporting whether a code
+// existed (and how many people were inside). Nothing ever called it, and it
+// answered an unbounded number of requests — a free oracle for enumerating
+// room codes that bypassed the rate limiter below entirely. Removed.
 
 // ---------------------------------------------------------- rooms
 // rooms[code] = {
@@ -304,10 +336,9 @@ function leaveRoom(socket, code) {
     // The token stays valid for the original holder until it expires.
     setHost(room, null);
     if (room._hostTimer) { clearTimeout(room._hostTimer); room._hostTimer = null; }
-    if (remaining.length) {
-      room._hostTimer = setTimeout(() => transferHost(room, code), HOST_GRACE_MS);
-      room._hostTimer.unref && room._hostTimer.unref();
-    }
+    // Restart the window from now — even if everyone else has already gone,
+    // so the holder's 30s isn't extended by the room emptying.
+    ensureHostTimer(room, code);
   }
   touch(room);
   if (remaining.length) emitMembers(room, code);
@@ -331,6 +362,19 @@ function transferHost(room, code) {
   emitMembers(room, code);
 }
 
+// A room with no host must have a grace timer running, or it can get stuck
+// hostless for good: the timer fires while the room is empty, transferHost()
+// finds nobody to promote and returns, and nothing ever starts another one.
+// Joining a room with no host therefore (re)arms the clock, which leaves the
+// original token holder one more HOST_GRACE_MS to reclaim before anyone else
+// is promoted. Callers that are about to hand out the crown skip this.
+function ensureHostTimer(room, code) {
+  if (room._hostTimer) return;
+  if (Object.values(room.members).some((m) => m.isHost)) return;
+  room._hostTimer = setTimeout(() => transferHost(room, code), HOST_GRACE_MS);
+  room._hostTimer.unref && room._hostTimer.unref();
+}
+
 // Expire rooms idle for more than a day (and with nobody inside).
 setInterval(() => {
   const cutoff = Date.now() - 24 * 3600 * 1000;
@@ -350,6 +394,8 @@ io.use((socket, next) => {
   const name = validDisplayName(a.displayName);
   const gid = validGuestId(a.guestId);
   if (!name || !gid) return next(new Error('name-required'));
+  // resolved once per connection — see rateKeyOf()
+  socket.rateKey = rateKeyOf(socket.handshake);
   // uid is server-issued per connection: what gets broadcast and what
   // kicks/host checks run on — client-declared guestId is NOT identity
   // (it's only a handle for best-effort bans and the display name).
@@ -367,7 +413,7 @@ io.on('connection', (socket) => {
 
   socket.on('create-room', (opts, cb) => {
     if (typeof opts === 'function') { cb = opts; opts = {}; }
-    if (!rateOk('room:' + socket.handshake.address, 30, 60000)) {
+    if (!rateOk('room:' + socket.rateKey, 30, 60000)) {
       if (typeof cb === 'function') cb({ ok: false, error: 'rate-limited' });
       return;
     }
@@ -424,7 +470,7 @@ io.on('connection', (socket) => {
   socket.on('join-room', (code, opts, cb) => {
     if (typeof opts === 'function') { cb = opts; opts = {}; }
     code = (code || '').toUpperCase().trim();
-    if (!rateOk('room:' + socket.handshake.address, 30, 60000)) {
+    if (!rateOk('room:' + socket.rateKey, 30, 60000)) {
       if (typeof cb === 'function') cb({ ok: false, error: 'rate-limited' });
       return;
     }
@@ -455,9 +501,10 @@ io.on('connection', (socket) => {
       room.members[socket.id] = member;
       joinedCode = code;
       socket.join(code);
-      // Hostship only via the secret token. There is deliberately NO
-      // "first joiner becomes host" fallback — a guessed room code must
-      // never be able to take a persisted room over.
+      // Hostship only via the secret token. A plain joiner never takes the
+      // crown immediately — the oldest this can be granted is after the
+      // grace window below expires, during which the token holder can
+      // still reclaim it by presenting the token.
       if (claimed) {
         setHost(room, member);
         if (room._hostTimer) { clearTimeout(room._hostTimer); room._hostTimer = null; }
@@ -469,6 +516,9 @@ io.on('connection', (socket) => {
       }
       if (claimed) { setHost(room, member); if (room._hostTimer) { clearTimeout(room._hostTimer); room._hostTimer = null; } }
     }
+    // Room is hostless (nobody holds the crown, token never claimed): arm
+    // the grace clock so it is never stuck that way — see ensureHostTimer.
+    if (!member.isHost) ensureHostTimer(room, code);
     touch(room);
     if (typeof cb === 'function') {
       cb({
@@ -627,7 +677,10 @@ io.on('connection', (socket) => {
     // (outside the window set by the previous advance) advances the queue.
     if (room._skipUntil && Date.now() < room._skipUntil) return;
     const member = memberOf(room, socket);
-    if (!member || isListener(member)) return;
+    // Same gate as 'skip': a track ending is still a way to push the queue
+    // forward, so in djOnly mode only the host's report counts. Checking
+    // isListener alone let any plain member fast-forward the room.
+    if (!canControl(room, member)) return;
     advance(room, joinedCode);
   });
 
@@ -825,4 +878,31 @@ io.on('connection', (socket) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`SyncBeat v2 running on http://localhost:${PORT}`);
+});
+
+// Flush on shutdown. scheduleSave() debounces by 1.5s, and a host (Render,
+// Railway, systemd, Ctrl+C) can kill us inside that window — without this
+// the last few seconds of chat, queue edits and bans never reach disk.
+// persistNow() is synchronous, so it is safe on the way out.
+let shuttingDown = false;
+function shutdown(sig) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(sig + ': flushing room state');
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  persistNow();
+  try { io.close(); } catch (e) { /* already closing */ }
+  // Nothing should need this — io.close() drops the handles — but a stuck
+  // connection must not keep the process alive forever.
+  setTimeout(() => process.exit(0), 1000);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+// Safety net for `process.exit()` from anywhere else: 'exit' only allows
+// synchronous work, which persistNow() happens to be.
+process.on('exit', () => {
+  if (shuttingDown || !saveTimer) return;
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  persistNow();
 });
