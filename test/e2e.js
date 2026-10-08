@@ -6,22 +6,27 @@ const os = require('os');
 const http = require('http');
 const { spawn } = require('child_process');
 const { io } = require('socket.io-client');
+const SyncEcho = require('../public/echo.js');
 
 const ROOT = path.join(__dirname, '..');
-const PORT = 3099;
+// Unique per run: a server left behind by an earlier run (Windows is slow to
+// release these) would otherwise make this one fail to bind and look like a
+// product bug.
+const PORT = 3099 + (process.pid % 400);
 const BASE = 'http://localhost:' + PORT;
-// second server, used to exercise the TRUST_PROXY=1 rate-limit key
-const PORT2 = 3098;
+// second server, used to exercise the TRUST_PROXY=1 rate-limit key and the
+// room cap
+const PORT2 = PORT + 1;
 const BASE2 = 'http://localhost:' + PORT2;
 const fail = (m) => { console.error('FAIL:', m); shutdown(1); };
 const ok = (m) => console.log('ok:', m);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const once = (s, ev) => new Promise((res, rej) => {
-  const t = setTimeout(() => rej(new Error('event timeout: ' + ev)), 5000);
+  const t = setTimeout(() => rej(new Error('event timeout: ' + ev)), 10000);
   s.once(ev, (v) => { clearTimeout(t); res(v); });
 });
 const emitAck = (s, ev, ...args) => new Promise((res, rej) => {
-  const t = setTimeout(() => rej(new Error('ack timeout: ' + ev)), 5000);
+  const t = setTimeout(() => rej(new Error('ack timeout: ' + ev)), 10000);
   s.emit(ev, ...args, (r) => { clearTimeout(t); res(r); });
 });
 
@@ -342,12 +347,122 @@ async function waitRunning(srv, label) {
   if (oracle !== 404) fail('GET /api/room/:code should be gone, got ' + oracle);
   ok('unused /api/room/:code removed (no room-code oracle)');
 
+  // ---- queue ownership, self-starting queue, stale echoes, slim heartbeat ----
+  const O = client({ guestId: 'guestO0011', displayName: 'Omid' });
+  await once(O, 'connect');
+  const oc = await emitAck(O, 'create-room', {});
+  if (!oc || !oc.ok) fail('ownership setup create: ' + JSON.stringify(oc));
+  const ocode = oc.code;
+  if (!oc.ownerSecret || !oc.ownerTag || oc.ownerTag === oc.ownerSecret) {
+    fail('ownerSecret/ownerTag missing or identical: ' +
+      JSON.stringify({ secret: !!oc.ownerSecret, tag: oc.ownerTag }));
+  }
+
+  const a1 = await emitAck(O, 'queue-add', { type: 'audio', url: 'https://x.test/alpha.mp3', title: 'Alpha' });
+  if (!a1 || !a1.ok) fail('ownership queue-add: ' + JSON.stringify(a1));
+  const s0 = await emitAck(O, 'sync-request');
+  if (!s0.isPlaying) fail('first track must start playing by itself: ' + JSON.stringify(s0));
+  await emitAck(O, 'queue-add', { type: 'audio', url: 'https://x.test/beta.mp3', title: 'Beta' });
+  await emitAck(O, 'queue-add', { type: 'audio', url: 'https://x.test/gamma.mp3', title: 'Gamma' });
+
+  const s1 = await emitAck(O, 'sync-request');
+  const gamma = (s1.queue || []).find((t) => t.title === 'Gamma');
+  if (!gamma || !gamma.addedBy || !gamma.addedBy.ownerId) {
+    fail('queued track carries no ownerId: ' + JSON.stringify(gamma));
+  } else if (gamma.addedBy.ownerId !== oc.ownerTag) {
+    fail('ownerId is not the queueing member\'s tag');
+  }
+  if (JSON.stringify(s1).indexOf(oc.ownerSecret) !== -1) fail('raw ownerSecret leaked into room state');
+
+  await emitAck(O, 'skip');
+  const s2 = await emitAck(O, 'sync-request');
+  if (!s2.track || s2.track.title !== 'Beta' || !s2.isPlaying) {
+    fail('queue must keep playing across a skip: ' +
+      JSON.stringify({ track: s2.track && s2.track.title, playing: s2.isPlaying }));
+  }
+  ok('queue self-starts and keeps playing across a skip');
+
+  // A second member reusing the host's guestId used to inherit its rights.
+  const P = client({ guestId: 'guestO0011', displayName: 'Pari' });
+  await once(P, 'connect');
+  const jp = await emitAck(P, 'join-room', ocode, {});
+  if (!jp || !jp.ok) fail('same-guestId join: ' + JSON.stringify(jp));
+  if (jp.ownerTag === oc.ownerTag) fail('ownerTag must be per member, not per guestId');
+  const spoil = await emitAck(P, 'queue-remove', gamma.id);
+  if (!spoil || spoil.ok !== false) fail('stolen guestId could still delete: ' + JSON.stringify(spoil));
+
+  // ...and the real owner, who is NOT the host, still can.
+  const Q = client({ guestId: 'guestQ0012', displayName: 'Qara' });
+  await once(Q, 'connect');
+  const jq = await emitAck(Q, 'join-room', ocode, {});
+  if (!jq || !jq.ok || jq.isHost) fail('third member join: ' + JSON.stringify(jq));
+  const qAdd = await emitAck(Q, 'queue-add', { type: 'audio', url: 'https://x.test/delta.mp3', title: 'Delta' });
+  if (!qAdd || !qAdd.ok) fail('third member queue-add: ' + JSON.stringify(qAdd));
+  const sq = await emitAck(Q, 'sync-request');
+  const delta = (sq.queue || []).find((t) => t.title === 'Delta');
+  if (!delta) fail('Delta missing from queue: ' + JSON.stringify(sq.queue));
+  const otherDenied = await emitAck(P, 'queue-remove', delta.id);
+  if (!otherDenied || otherDenied.ok !== false) fail('non-owner could delete: ' + JSON.stringify(otherDenied));
+  const ownerOk = await emitAck(Q, 'queue-remove', delta.id);
+  if (!ownerOk || !ownerOk.ok) fail('owner could not delete own track: ' + JSON.stringify(ownerOk));
+  ok('queue ownership: hash proves it, guestId does not');
+  O.emit('leave-room'); P.emit('leave-room'); Q.emit('leave-room');
+  await sleep(300);
+
+  // ---- control echoes carry a seq so a late one cannot resurrect state ----
+  const O2 = client({ guestId: 'guestO0011', displayName: 'Omid' });
+  await once(O2, 'connect');
+  const oc2 = await emitAck(O2, 'create-room', {});
+  if (!oc2 || !oc2.ok) fail('echo setup create: ' + JSON.stringify(oc2));
+  await emitAck(O2, 'queue-add', { type: 'audio', url: 'https://x.test/one.mp3', title: 'One' });
+  const e1 = await emitAck(O2, 'sync-request');
+  if (!e1.isPlaying) fail('echo setup should be playing');
+  O2.emit('pause', 4, (e1.seq || 0) - 9); // seq the room has already moved past
+  await sleep(300);
+  const e2 = await emitAck(O2, 'sync-request');
+  if (!e2.isPlaying) fail('a stale control echo changed the room: ' + JSON.stringify(e2));
+  O2.emit('pause', 4, e2.seq); // same seq = an echo of what we already applied
+  await sleep(300);
+  const e3 = await emitAck(O2, 'sync-request');
+  if (e3.isPlaying !== false || e3.seq !== e2.seq) {
+    fail('a matching-seq echo should apply silently: ' +
+      JSON.stringify({ playing: e3.isPlaying, seq: [e2.seq, e3.seq] }));
+  }
+  ok('control echoes: stale seq dropped, current seq applied without rebroadcast');
+
+  // ---- heartbeat payload ----
+  const tick = await emitAck(O2, 'ping-state');
+  const tickJson = JSON.stringify(tick || null);
+  if (!tick || 'chat' in tick || 'queue' in tick || 'history' in tick || 'members' in tick) {
+    fail('ping-state is not slim: ' + tickJson);
+  } else if (tickJson.length * 3 > JSON.stringify(await emitAck(O2, 'sync-request')).length) {
+    fail('ping-state is not meaningfully smaller: ' + tickJson.length);
+  }
+  ok('heartbeat returns only what the drift check needs');
+
+  // ---- SoundCloud cannot honour a playback rate ----
+  await emitAck(O2, 'set-speed', 1.5);
+  await emitAck(O2, 'queue-add', { type: 'soundcloud', url: 'https://soundcloud.com/a/b', title: 'Cloudy' });
+  await emitAck(O2, 'skip');
+  const e4 = await emitAck(O2, 'sync-request');
+  if (e4.speed !== 1) fail('a SoundCloud track must pin the room to 1x: ' + e4.speed);
+  const scRefused = await emitAck(O2, 'set-speed', 1.5);
+  if (!scRefused || scRefused.ok !== false || scRefused.error !== 'speed-unsupported') {
+    fail('set-speed should be refused on SoundCloud: ' + JSON.stringify(scRefused));
+  }
+  ok('SoundCloud pins the room speed (the widget has no rate control)');
+  O2.emit('leave-room');
+  await sleep(200);
+
   // ---- rate limit keyed per forwarded client when TRUST_PROXY=1 ----
   // its own data dir: two processes must never race on the same rooms.json
   dataDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-test-proxy-'));
-  const proxySrv = startServer({ PORT: String(PORT2), TRUST_PROXY: '1', SB_DATA_DIR: dataDir2 });
+  const proxySrv = startServer({
+    PORT: String(PORT2), TRUST_PROXY: '1', SB_DATA_DIR: dataDir2, MAX_ROOMS: '2',
+  });
   extraServers.push(proxySrv);
   await waitRunning(proxySrv, 'TRUST_PROXY server');
+  await sleep(300); // let the listener settle before the first handshake
   const pbase = 'http://localhost:' + PORT2;
   // Both sockets carry the SAME forged leftmost value; only the rightmost
   // (added by our edge) differs. If the server keyed on the leftmost entry
@@ -370,6 +485,17 @@ async function waitRunning(srv, label) {
     fail('buckets are not isolated per forwarded client (leftmost entry was trusted?)');
   }
   ok('TRUST_PROXY=1 keys on the rightmost forwarded client, per-IP buckets isolated');
+
+  // ---- ceiling on live rooms (same server, fresh data dir => 0 rooms) ----
+  const cap1 = await emitAck(PB, 'create-room', {});
+  const cap2 = await emitAck(PB, 'create-room', {});
+  const cap3 = await emitAck(PB, 'create-room', {});
+  const capCreated = [cap1, cap2, cap3].filter((r) => r && r.ok).length;
+  const capFull = [cap1, cap2, cap3].find((r) => r && r.error === 'server-full');
+  if (capCreated !== 2 || !capFull) {
+    fail('MAX_ROOMS not enforced: ' + JSON.stringify([cap1, cap2, cap3]));
+  }
+  ok('room cap enforced (MAX_ROOMS)');
 
   // ---- rate limit (shares the per-IP window with everything above) ----
   const R = client({ guestId: 'guestR0007', displayName: 'Rate' });
@@ -448,6 +574,56 @@ async function waitRunning(srv, label) {
   if (!restored[sc.code]) fail('shutdown did not flush the pending room');
   if (after.indexOf('flush-me-please') === -1) fail('shutdown did not flush the pending chat');
   ok('shutdown flushes pending room state to disk');
+
+  // ---- echo policy: is this media event the user's, or the player's? ----
+  // Pure logic from public/echo.js — no server needed, but it decides whether
+  // a button press reaches the room at all, so it is worth pinning down.
+  {
+    const e = SyncEcho.create();
+    const r1 = e.resolve('play');
+    if (!r1.send || r1.seq !== undefined) fail('an unmarked event must be a fresh command: ' + JSON.stringify(r1));
+
+    e.expectEcho('play', 7);
+    const r2 = e.resolve('play');
+    if (!r2.send || r2.seq !== 7) fail('an echo must carry its seq: ' + JSON.stringify(r2));
+    const r3 = e.resolve('play');
+    if (!r3.send || r3.seq !== undefined) fail('an expectation is one-shot: ' + JSON.stringify(r3));
+
+    e.expectDrop(['pause', 'seeked', 'ended']);
+    if (e.resolve('pause').send !== false) fail('our own teardown must stay silent');
+    if (e.resolve('seeked').send !== false) fail('our own seek must stay silent');
+    if (e.resolve('play').send !== true) fail('a drop must not cover unrelated events');
+
+    // a server command arriving over our own track swap still wins
+    e.expectDrop(['pause']);
+    e.expectEcho('pause', 42);
+    const r4 = e.resolve('pause');
+    if (!r4.send || r4.seq !== 42) fail('the newest instruction supersedes a drop: ' + JSON.stringify(r4));
+
+    // swallow the expected teardown, then let the user's own press through
+    const e2 = SyncEcho.create();
+    e2.expectDrop(['pause']);
+    if (e2.consumeDrop('ended') !== false) fail('a drop must be per event kind');
+    if (e2.resolve('pause').send !== false) fail('first teardown event is dropped');
+    if (e2.resolve('pause').send !== true) fail('the user\'s own press after that must go out');
+
+    // expired expectations must not still be swallowing events — arm them on
+    // the real clock first, then move the clock past both deadlines
+    const realNow = Date.now;
+    const e3 = SyncEcho.create();
+    e3.expectEcho('play', 3);
+    e3.expectDrop(['pause']);
+    try {
+      Date.now = () => realNow() + SyncEcho.ECHO_MS + 1000;
+      const late = e3.resolve('play');
+      if (!late.send || late.seq !== undefined) fail('expired echo should fall back to a fresh command: ' + JSON.stringify(late));
+      if (e3.resolve('pause').send !== true) fail('expired drop should stop swallowing');
+    } finally { Date.now = realNow; }
+
+    e.clear();
+    if (e.size().echoes !== 0 || e.size().drops !== 0) fail('clear() must empty both lists');
+    ok('echo policy: user presses go out, our own events do not, seq survives');
+  }
 
   console.log('ALL PASS');
   shutdown(0);

@@ -85,10 +85,55 @@ setInterval(() => {
 // this long so an honest rejoin with the token keeps the host title.
 const HOST_GRACE_MS = parseInt(process.env.HOST_GRACE_MS || '30000', 10);
 
+// Ceiling on live rooms (overridable) so a code-guessing flood cannot grow
+// the in-memory map without bound between sweeps.
+const MAX_ROOMS = parseInt(process.env.MAX_ROOMS || '2000', 10);
+
 app.use(express.static(path.join(__dirname, 'public')));
 
 // whitelists used by the restore IIFE below as well as the handlers
 const VALID_SPEEDS = [0.75, 1, 1.25, 1.5, 2];
+
+// ---------------------------------------------------------- playback clock
+// Position is extrapolated from (now - updatedAt). Using Date.now() there
+// means time the machine spent asleep counts as playback: a laptop closed
+// mid-track jumps the playhead by the whole sleep on wake, and every client
+// then seeks past the end and cascades through the queue. hrtime does not
+// advance while the machine is suspended, which matches what the players do.
+// updatedAt (wall clock) is still kept for persistence and readability.
+const monoNow = () => process.hrtime.bigint();
+function stamp(room) {
+  room.updatedAt = Date.now();
+  room.updatedAtMono = monoNow();
+}
+
+// ---------------------------------------------------------- command sequence
+// Every playback change bumps room.seq and the new value rides along with the
+// broadcast. A client that merely APPLIES a command echoes the seq it was
+// given; if the room has already moved on, that echo is stale and is dropped.
+// Without this a buffering client's late 'play' can undo a pause the host
+// issued in the meantime and resume everyone behind their back.
+function bumpSeq(room) {
+  room.seq = (room.seq || 0) + 1;
+  return room.seq;
+}
+function echoKind(room, seq) {
+  if (typeof seq !== 'number' || !isFinite(seq)) return 'fresh';
+  return seq === (room.seq || 0) ? 'echo' : 'stale';
+}
+
+// ---------------------------------------------------------- queue ownership
+// addedBy.ownerTag is a HASH of a per-member secret: it rides along with the
+// queue so everyone can see who added what, but only the holder of the secret
+// can delete the item. guestId cannot do this job — the client picks it, so
+// claiming someone else's is trivial (reproduced before this was added).
+const OWNER_SECRET_RE = /^[A-Za-z0-9_-]{24,64}$/;
+const ownerTag = (secret) =>
+  crypto.createHash('sha256').update(secret).digest('base64url').slice(0, 32);
+const newOwnerSecret = () => crypto.randomBytes(24).toString('base64url');
+function adoptOwnerSecret(v) {
+  return typeof v === 'string' && OWNER_SECRET_RE.test(v) ? v : newOwnerSecret();
+}
 
 // ---------------------------------------------------------- persistence
 const DATA_DIR = process.env.SB_DATA_DIR || path.join(__dirname, 'data');
@@ -111,6 +156,9 @@ function scheduleSave() {
     saveTimer = null;
     persistNow();
   }, 1500);
+  // Never the reason the process stays alive — the listening server is, and
+  // shutdown() flushes anything still pending on the way out.
+  saveTimer.unref && saveTimer.unref();
 }
 function persistNow() {
   try {
@@ -195,7 +243,9 @@ const rooms = {};
       chat: Array.isArray(s.chat) ? s.chat : [],
       isPlaying: false, // never resume playing after a restart
       position: typeof s.position === 'number' ? s.position : 0,
+      seq: 0,
       updatedAt: Date.now(),
+      updatedAtMono: monoNow(),
       createdAt: s.createdAt || Date.now(),
       lastActive: s.lastActive || Date.now(),
       djOnly: !!s.djOnly,
@@ -219,7 +269,13 @@ function currentPosition(room) {
   if (!room.isPlaying) return room.position;
   // media time advances at room.speed, not wall-clock time
   const speed = VALID_SPEEDS.includes(room.speed) ? room.speed : 1;
-  return room.position + ((Date.now() - room.updatedAt) / 1000) * speed;
+  let secs;
+  if (typeof room.updatedAtMono === 'bigint') {
+    secs = Number(monoNow() - room.updatedAtMono) / 1e9;
+  } else {
+    secs = (Date.now() - room.updatedAt) / 1000;
+  }
+  return room.position + (secs > 0 ? secs : 0) * speed;
 }
 function liveMembers(room) {
   return Object.values(room.members).map((m) => ({
@@ -246,6 +302,21 @@ function roomState(room) {
     hostId: room.hostId,
     djOnly: !!room.djOnly,
     speed: VALID_SPEEDS.includes(room.speed) ? room.speed : 1,
+    seq: room.seq || 0,
+  };
+}
+
+// Heartbeat answer. The 5s drift check only needs to know whether the room is
+// playing and roughly where it is, but it was asking for roomState() and so
+// shipped the whole chat log, queue and member list to every client four
+// times a minute each.
+function tickState(room) {
+  return {
+    track: !!room.track,
+    isPlaying: room.isPlaying,
+    position: currentPosition(room),
+    speed: VALID_SPEEDS.includes(room.speed) ? room.speed : 1,
+    seq: room.seq || 0,
   };
 }
 function touch(room) {
@@ -288,7 +359,12 @@ function makeTrackItem(input, title, user) {
     type: input.type,
     url: input.url,
     title: cleanTitle(title, input.type === 'youtube' ? 'YouTube · ' + input.url : input.url.slice(0, 80)),
-    addedBy: { userId: user.id, guestId: user.guestId, username: user.username },
+    addedBy: {
+      userId: user.id,
+      guestId: user.guestId,
+      username: user.username,
+      ownerId: user.ownerTag, // hash — safe to broadcast, useless without the secret
+    },
     addedAt: Date.now(),
   };
 }
@@ -319,8 +395,24 @@ function canControl(room, member) {
   return true;
 }
 
+// The SoundCloud widget exposes no playback-rate control, so a room speed
+// other than 1x would run the server clock ahead of the audio and leave
+// every SC track drifting forever (the heartbeat would then re-seek it every
+// 5s and it would stutter). Snap to 1x whenever one of those is loaded.
+function lockSpeedFor(room, code) {
+  if (!room.track || room.track.type !== 'soundcloud') return false;
+  if (room.speed === 1) return false;
+  room.speed = 1;
+  io.to(code).emit('speed-change', 1);
+  return true;
+}
+function soundcloudSpeedBlocked(room, v) {
+  return !!(room.track && room.track.type === 'soundcloud' && v !== 1);
+}
+
 function emitMembers(room, code) {
-  io.to(code).emit('room-users', liveMemberCount(room));
+  // One event only: the client used to set the online count from a second
+  // 'room-users' payload as well, so the number was written twice per update.
   io.to(code).emit('members', liveMembers(room));
 }
 
@@ -386,7 +478,7 @@ setInterval(() => {
     }
   }
   if (dropped) { console.log('swept rooms:', dropped); scheduleSave(); }
-}, 10 * 60 * 1000);
+}, 10 * 60 * 1000).unref();
 
 // ---------------------------------------------------------- socket identity (guest)
 io.use((socket, next) => {
@@ -399,11 +491,15 @@ io.use((socket, next) => {
   // uid is server-issued per connection: what gets broadcast and what
   // kicks/host checks run on — client-declared guestId is NOT identity
   // (it's only a handle for best-effort bans and the display name).
+  // Per-member queue-ownership secret. join-room may re-adopt an earlier one
+  // so a refresh keeps the right to delete what this browser queued.
+  socket.ownerSecret = newOwnerSecret();
   socket.user = {
     id: crypto.randomBytes(9).toString('base64url'),
     guestId: gid,
     username: name,
     color: avatarColor(name),
+    ownerTag: ownerTag(socket.ownerSecret),
   };
   next();
 });
@@ -415,6 +511,12 @@ io.on('connection', (socket) => {
     if (typeof opts === 'function') { cb = opts; opts = {}; }
     if (!rateOk('room:' + socket.rateKey, 30, 60000)) {
       if (typeof cb === 'function') cb({ ok: false, error: 'rate-limited' });
+      return;
+    }
+    // Rooms linger for 24h after emptying, so without a ceiling a client with
+    // several IPs could fill memory faster than the sweeper drains it.
+    if (Object.keys(rooms).length >= MAX_ROOMS) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'server-full' });
       return;
     }
     if (joinedCode) leaveRoom(socket, joinedCode);
@@ -432,7 +534,9 @@ io.on('connection', (socket) => {
       chat: [],
       isPlaying: false,
       position: 0,
+      seq: 0,
       updatedAt: Date.now(),
+      updatedAtMono: monoNow(),
       createdAt: Date.now(),
       lastActive: Date.now(),
       djOnly: false,
@@ -459,6 +563,8 @@ io.on('connection', (socket) => {
         code,
         uid: socket.user.id,
         hostToken,
+        ownerSecret: socket.ownerSecret,
+        ownerTag: socket.user.ownerTag,
         isHost: true,
         role: room.members[socket.id].role,
         state: roomState(room),
@@ -486,6 +592,12 @@ io.on('connection', (socket) => {
     const wantListener = !!(opts && opts.asListener);
     const token = opts && typeof opts.hostToken === 'string' ? opts.hostToken : null;
     const claimed = !!(token && room.hostToken && token === room.hostToken);
+    // Re-adopt the queue-ownership secret this browser already holds, so a
+    // refresh does not lose the right to delete its own queued tracks.
+    if (opts && opts.ownerSecret !== undefined) {
+      socket.ownerSecret = adoptOwnerSecret(opts.ownerSecret);
+      socket.user.ownerTag = ownerTag(socket.ownerSecret);
+    }
     const existing = room.members[socket.id];
     let member;
     if (code !== joinedCode || !existing) {
@@ -526,6 +638,8 @@ io.on('connection', (socket) => {
         code,
         uid: socket.user.id,
         hostToken: claimed ? room.hostToken : undefined,
+        ownerSecret: socket.ownerSecret,
+        ownerTag: socket.user.ownerTag,
         isHost: !!member.isHost,
         role: member.role,
         state: roomState(room),
@@ -557,13 +671,20 @@ io.on('connection', (socket) => {
     }
     const item = makeTrackItem(clean, payload && payload.title, socket.user);
     if (!room.track) {
+      // Nothing was playing, so this becomes the current track and starts —
+      // loading it paused meant every track needed a fresh ▶ click, and the
+      // queue stopped dead after each one. A browser that refuses autoplay
+      // keeps the room "playing" anyway; the client's 5s heartbeat retries
+      // until the user has interacted with the page.
       room.track = item;
-      room.isPlaying = false;
       room.position = 0;
-      room.updatedAt = Date.now();
+      room.isPlaying = true;
+      stamp(room);
+      lockSpeedFor(room, joinedCode);
       touch(room);
       io.to(joinedCode).emit('load-track', room.track);
       io.to(joinedCode).emit('queue-update', room.queue);
+      io.to(joinedCode).emit('play', 0, bumpSeq(room));
     } else {
       if (room.queue.length >= 100) {
         if (typeof cb === 'function') cb({ ok: false, error: 'queue-full' });
@@ -595,7 +716,10 @@ io.on('connection', (socket) => {
       return;
     }
     const item = room.queue[i];
-    const mine = item.addedBy && item.addedBy.guestId === socket.user.guestId;
+    // Ownership is proven with the secret's hash, not with guestId — anyone
+    // can send whatever guestId they like in the handshake.
+    const mine = !!(item.addedBy && item.addedBy.ownerId &&
+      item.addedBy.ownerId === socket.user.ownerTag);
     const host = roomHost(socket, room);
     if (!mine && !host) {
       if (typeof cb === 'function') cb({ ok: false, error: 'not-allowed' });
@@ -628,6 +752,8 @@ io.on('connection', (socket) => {
     // every client fires ENDED for the same track, and without this window
     // N clients would skip N tracks.
     room._skipUntil = Date.now() + 2000;
+    // Whatever control echo is still in flight belongs to the old track now.
+    const seq = bumpSeq(room);
     if (room.track) {
       room.history.push({ ...room.track, playedAt: Date.now() });
       room.history = room.history.slice(-30);
@@ -635,16 +761,20 @@ io.on('connection', (socket) => {
     }
     if (room.queue.length) {
       room.track = room.queue.shift();
-      room.isPlaying = false;
       room.position = 0;
-      room.updatedAt = Date.now();
+      // Keep the queue rolling: leaving isPlaying false here meant every
+      // track ended with the room stopped, waiting for another ▶ click.
+      room.isPlaying = true;
+      stamp(room);
+      lockSpeedFor(room, code);
       io.to(code).emit('load-track', room.track);
       io.to(code).emit('queue-update', room.queue);
+      io.to(code).emit('play', 0, seq);
     } else {
       room.track = null;
       room.isPlaying = false;
       room.position = 0;
-      room.updatedAt = Date.now();
+      stamp(room);
       io.to(code).emit('load-track', null);
     }
     touch(room);
@@ -684,40 +814,51 @@ io.on('connection', (socket) => {
     advance(room, joinedCode);
   });
 
-  socket.on('play', (position) => {
+  socket.on('play', (position, seq) => {
     const room = needRoom();
     if (!room) return;
     if (!canControl(room, memberOf(room, socket))) return;
+    // A late echo of something the room has already moved past must not
+    // resurrect it — that is how a buffering client undid the host's pause.
+    const kind = echoKind(room, seq);
+    if (kind === 'stale') return;
     const pos = safePos(position);
     room.isPlaying = true;
     if (pos !== null) room.position = pos;
-    room.updatedAt = Date.now();
+    stamp(room);
     touch(room);
-    socket.to(joinedCode).emit('play', room.position);
+    if (kind === 'echo') return; // applied for the sender, nothing to relay
+    socket.to(joinedCode).emit('play', room.position, bumpSeq(room));
   });
 
-  socket.on('pause', (position) => {
+  socket.on('pause', (position, seq) => {
     const room = needRoom();
     if (!room) return;
     if (!canControl(room, memberOf(room, socket))) return;
+    const kind = echoKind(room, seq);
+    if (kind === 'stale') return;
     const pos = safePos(position);
     room.isPlaying = false;
     if (pos !== null) room.position = pos;
-    room.updatedAt = Date.now();
+    stamp(room);
     touch(room);
-    socket.to(joinedCode).emit('pause', room.position);
+    if (kind === 'echo') return;
+    socket.to(joinedCode).emit('pause', room.position, bumpSeq(room));
   });
 
-  socket.on('seek', (position) => {
+  socket.on('seek', (position, seq) => {
     const room = needRoom();
     if (!room) return;
     if (!canControl(room, memberOf(room, socket))) return;
+    const kind = echoKind(room, seq);
+    if (kind === 'stale') return;
     const pos = safePos(position);
     if (pos === null) return;
     room.position = pos;
-    room.updatedAt = Date.now();
+    stamp(room);
     touch(room);
-    socket.to(joinedCode).emit('seek', room.position);
+    if (kind === 'echo') return;
+    socket.to(joinedCode).emit('seek', room.position, bumpSeq(room));
   });
 
   socket.on('chat-message', (text, cb) => {
@@ -854,11 +995,17 @@ io.on('connection', (socket) => {
       if (typeof cb === 'function') cb({ ok: false, error: 'bad-speed' });
       return;
     }
+    // SC has no playback-rate API — changing it would desync the track.
+    if (soundcloudSpeedBlocked(room, v)) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'speed-unsupported' });
+      return;
+    }
     // rebase position at the OLD speed first, then switch — otherwise the
     // estimated clock jumps by the speed ratio
     room.position = currentPosition(room);
-    room.updatedAt = Date.now();
     room.speed = v;
+    stamp(room);
+    bumpSeq(room); // invalidate control echoes stamped at the old rate
     touch(room);
     io.to(joinedCode).emit('speed-change', v);
     if (typeof cb === 'function') cb({ ok: true, speed: v });
@@ -868,6 +1015,13 @@ io.on('connection', (socket) => {
     const room = needRoom();
     if (!room) return;
     if (typeof cb === 'function') cb(roomState(room));
+  });
+
+  // What the 5s drift heartbeat actually needs — see tickState().
+  socket.on('ping-state', (cb) => {
+    const room = needRoom();
+    if (typeof cb !== 'function') return;
+    cb(room ? tickState(room) : null);
   });
 
   socket.on('disconnect', () => {

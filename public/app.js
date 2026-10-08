@@ -48,9 +48,32 @@ function saveHostToken(code, tok) {
   try {
     const m = hostTokens();
     if (tok) m[code] = tok; else delete m[code];
+    // Rooms are only swept after 24h idle, but this map would otherwise keep
+    // one entry for every room this browser ever made, forever.
+    const keys = Object.keys(m);
+    if (keys.length > 50) keys.slice(0, keys.length - 50).forEach((k) => delete m[k]);
     localStorage.setItem('sb-hosts', JSON.stringify(m));
   } catch (e) {}
 }
+
+// Queue-ownership secrets — same shape and lifetime as host tokens. The
+// server echoes back only a HASH of this (addedBy.ownerId), which is safe to
+// broadcast; the secret itself travels back on join and is what proves a
+// queued track is ours to delete.
+function ownerSecrets() {
+  try { return JSON.parse(localStorage.getItem('sb-owners') || '{}'); } catch (e) { return {}; }
+}
+function getOwnerSecret(code) { return ownerSecrets()[code] || null; }
+function saveOwnerSecret(code, secret) {
+  try {
+    const m = ownerSecrets();
+    if (secret) m[code] = secret; else delete m[code];
+    const keys = Object.keys(m);
+    if (keys.length > 50) keys.slice(0, keys.length - 50).forEach((k) => delete m[k]);
+    localStorage.setItem('sb-owners', JSON.stringify(m));
+  } catch (e) {}
+}
+let MY_OWNER_TAG = null;
 
 function validNameLocal(n) {
   n = String(n == null ? '' : n).trim().replace(/\s+/g, ' ');
@@ -136,9 +159,19 @@ function connectSocket() {
   ensureGuestId();
   socket = io({ auth: { guestId: GUEST_ID, displayName: ME.username } });
   bindSocket(socket);
+  let everConnected = false;
   socket.on('connect', () => {
     paintUser();
+    if (everConnected) setStatus('دوباره وصل شدی ✓');
+    if (!currentCode) lobbyError.textContent = ''; // clears any stale offline note
+    everConnected = true;
     autoRejoin();
+  });
+  // Nothing told the user the link had dropped — playback just silently
+  // stopped keeping up with everyone else.
+  socket.on('disconnect', () => {
+    const msg = 'اتصال قطع شد — دوباره تلاش می‌کنم…';
+    if (currentCode) setStatus(msg); else lobbyError.textContent = msg;
   });
   socket.on('connect_error', (err) => {
     if (err && err.message === 'name-required') {
@@ -154,7 +187,8 @@ function connectSocket() {
 let currentTrack = null;
 let ytPlayer = null, ytReady = false;
 let scPlayer = null, scReady = false, scDuration = 0;
-let suppress = false;
+// deciding whether a media event is ours to report — see public/echo.js
+const echo = SyncEcho.create();
 const SYNC_DRIFT = 1.2;
 let scrubbing = false;
 let pending = null;
@@ -216,8 +250,9 @@ createBtn.onclick = () => {
   lobbyError.textContent = '';
   socket.emit('create-room', (res) => {
     if (!res || !res.ok) {
-      lobbyError.textContent = res && res.error === 'rate-limited'
-        ? 'خیلی سریع می‌سازی — چند لحظه صبر کن'
+      lobbyError.textContent =
+        res && res.error === 'rate-limited' ? 'خیلی سریع می‌سازی — چند لحظه صبر کن'
+        : res && res.error === 'server-full' ? 'ظرفیت اتاق‌ها پُره — کمی بعد دوباره امتحان کن'
         : 'خطا در ساخت اتاق';
       return;
     }
@@ -233,7 +268,11 @@ joinBtn.onclick = () => {
 function doJoin(code, asListener) {
   if (!socket) return;
   lobbyError.textContent = '';
-  socket.emit('join-room', code, { asListener: !!asListener, hostToken: getHostToken(code) }, (res) => {
+  socket.emit('join-room', code, {
+    asListener: !!asListener,
+    hostToken: getHostToken(code),
+    ownerSecret: getOwnerSecret(code),
+  }, (res) => {
     if (!res || !res.ok) {
       const err = res && res.error;
       lobbyError.textContent = err === 'banned' ? 'هاست تو رو از این اتاق بیرون کرده'
@@ -251,6 +290,8 @@ function onEnteredRoom(res) {
   currentCode = res.code;
   if (ME) ME.uid = res.uid || null;
   if (res.hostToken) saveHostToken(res.code, res.hostToken);
+  if (res.ownerSecret) saveOwnerSecret(res.code, res.ownerSecret);
+  MY_OWNER_TAG = res.ownerTag || null;
   myRole = res.role || 'member';
   amHost = !!res.isHost;
   enterRoom(res.code);
@@ -275,7 +316,8 @@ function resetRoomUI() {
   currentCode = null; currentTrack = null; pending = null;
   updateAddBtn();
   myRole = 'member'; amHost = false; djOnly = false;
-  lastHostId = null; lastMembers = [];
+  lastMembers = [];
+  MY_OWNER_TAG = null;
   if (ME) ME.uid = null;
   withSuppress(() => stopAllPlayers());
   emptyMsg.classList.remove('hidden');
@@ -373,6 +415,9 @@ loadBtn.onclick = async () => {
     setStatus(myRole === 'listener' ? 'شنونده نمی‌تواند آهنگ اضافه کند 🎧' : 'فعلاً فقط DJ کنترل می‌کند');
     return;
   }
+  // captured now: the server sends 'load-track' before it acks, so by the
+  // time the callback runs currentTrack has already been filled in
+  const wasEmpty = !currentTrack;
   loadBtn.disabled = true;
   try {
     let payload;
@@ -382,7 +427,7 @@ loadBtn.onclick = async () => {
     else payload = { type: 'audio', url: raw, title: guessFileName(raw) };
     socket.emit('queue-add', payload, (res) => {
       if (res && !res.ok) setStatus(res.error === 'queue-full' ? 'صف پر است' : 'خطا در افزودن');
-      else { trackUrl.value = ''; setStatus('به صف اضافه شد ✓'); }
+      else { trackUrl.value = ''; setStatus(wasEmpty ? 'شروع پخش ✓' : 'به صف اضافه شد ✓'); }
     });
   } finally { loadBtn.disabled = false; }
 };
@@ -410,7 +455,9 @@ function paintQueue(q) {
   q = Array.isArray(q) ? q : [];
   queueCount.textContent = q.length;
   queueList.innerHTML = q.map((t) => {
-    const mine = ME && t.addedBy && t.addedBy.guestId === ME.id;
+    // Match on the server-issued hash, not guestId — guestId is ours to
+    // declare, so the button would appear on other people's tracks too.
+    const mine = !!(MY_OWNER_TAG && t.addedBy && t.addedBy.ownerId === MY_OWNER_TAG);
     const canDel = amHost || mine;
     return '<li class="q-item">' +
       '<span class="q-type">' + esc(t.type === 'youtube' ? 'YT' : t.type === 'soundcloud' ? 'SC' : 'MP3') + '</span>' +
@@ -437,7 +484,7 @@ function paintHistory(h) {
 }
 
 // ============================================================ members / roles
-function paintMembers(members, hostId, dj) {
+function paintMembers(members, dj) {
   members = Array.isArray(members) ? members : [];
   userCount.textContent = members.length || 1;
   djOnly = !!dj;
@@ -545,6 +592,7 @@ muteBtn.addEventListener('click', () => {
   applyVolume();
 });
 speedSel.addEventListener('change', () => {
+  const prev = speed;
   const next = parseFloat(speedSel.value) || 1;
   if (!canControlClient()) {
     // nobody gave you the controls — snap back to the room's speed
@@ -554,7 +602,19 @@ speedSel.addEventListener('change', () => {
   }
   speed = next;
   applySpeed();
-  if (socket) socket.emit('set-speed', speed);
+  if (!socket) return;
+  // The server can refuse (SoundCloud has no playback-rate API). Without
+  // this ack the select kept the rejected value and this player alone ran at
+  // the wrong rate until a reload.
+  socket.emit('set-speed', speed, (res) => {
+    if (res && res.ok) return;
+    speed = prev;
+    speedSel.value = String(speed);
+    applySpeed();
+    setStatus(res && res.error === 'speed-unsupported'
+      ? 'این آهنگ سرعت پخش رو تغییر نمی‌ده'
+      : 'اجازه تغییر سرعت نداری');
+  });
 });
 function applyRoomSpeed(v) {
   if (![0.75, 1, 1.25, 1.5, 2].includes(v)) return;
@@ -594,13 +654,25 @@ seekBar.addEventListener('input', () => {
   const d = getDuration();
   if (isFinite(d) && d > 0) timeCur.textContent = fmtTime((seekBar.value / 1000) * d);
 });
+// The position tick only rewrites the bar while something is playing, so a
+// rejected scrub had to be undone here or it stayed where the user dragged
+// it for as long as the room sat paused.
+function snapSeekBar() {
+  const d = getDuration();
+  const p = getPosition();
+  if (!isFinite(d) || d <= 0) return;
+  seekBar.value = Math.max(0, Math.min(1000, (p / d) * 1000));
+  updateSeekFill();
+  timeCur.textContent = fmtTime(p);
+}
 seekBar.addEventListener('change', () => {
   const d = getDuration();
   scrubbing = false;
-  if (!currentTrack || !isFinite(d) || d <= 0 || !socket) return;
+  if (!currentTrack || !isFinite(d) || d <= 0 || !socket) { snapSeekBar(); return; }
   if (!canControlClient()) {
     setStatus(myRole === 'listener' ? 'شنونده نمی‌تواند seek کند 🎧' : 'فعلاً فقط DJ کنترل می‌کند');
-    return; // bar snaps back on the next position tick
+    snapSeekBar();
+    return;
   }
   const t = (seekBar.value / 1000) * d;
   if (currentTrack.type === 'audio') {
@@ -639,9 +711,25 @@ audio.addEventListener('play', () => setPlayingUI(true));
 audio.addEventListener('pause', () => setPlayingUI(false));
 
 // ============================================================ sync core
-function withSuppress(fn) {
-  suppress = true;
-  try { fn(); } finally { setTimeout(() => (suppress = false), 250); }
+// Applying a command that came from the server must not be bounced straight
+// back. A plain time window does not work: <audio> can take seconds to
+// actually start, so its 'play' event lands long after the window closed and
+// looks like a local ▶ — and if the room has moved on by then, forwarding it
+// would undo the newer command (host pauses, a buffering client's late play
+// resumes everyone). Each remote command therefore registers the transitions
+// it expects plus the seq it was given; when the matching event fires it is
+// sent back with that seq, and the server tells an echo from a real action.
+// Run fn() while remembering what it is going to make the player emit —
+// see public/echo.js for how the two cases are told apart.
+function withSuppress(fn, kinds, seq) {
+  if (typeof seq === 'number') echo.expectEcho(kinds || ['play', 'pause', 'seeked'], seq);
+  else echo.expectDrop(['pause', 'seeked', 'ended']);
+  try { fn(); } catch (e) { /* player may not be ready yet */ }
+}
+function emitControl(kind, event, value) {
+  if (!socket) return;
+  const c = echo.resolve(kind);
+  if (c.send) socket.emit(event, value, c.seq);
 }
 function stopAllPlayers() {
   if (!audio.paused) { try { audio.pause(); } catch (e) {} }
@@ -656,6 +744,7 @@ function updateAddBtn() {
   loadBtn.textContent = currentTrack ? '+ صف' : '▶ پخش';
 }
 function loadTrack(track) {
+  pending = null; // belongs to the previous track, if it ever became ready
   withSuppress(() => stopAllPlayers());
   currentTrack = track;
   updateAddBtn();
@@ -701,20 +790,27 @@ function getDuration() {
   if (currentTrack.type === 'soundcloud') return scDuration || 0;
   return 0;
 }
-function doPlay(position) {
+// `seq` is the command id the server attached to this instruction; it is only
+// remembered so a player that becomes ready later still reports the right one.
+function stashPending(isPlaying, position, seq) {
+  pending = { isPlaying: isPlaying, position: position, seq: seq };
+}
+function doPlay(position, seq) {
   if (!currentTrack) return;
   if (currentTrack.type === 'audio') {
     if (typeof position === 'number' && Math.abs(audio.currentTime - position) > SYNC_DRIFT) audio.currentTime = position;
     applyVolume(); applySpeed();
     audio.play().catch(() => setStatus('برای پخش، یه‌بار روی صفحه کلیک کن.'));
-  } else if (currentTrack.type === 'youtube' && ytPlayer) {
+  } else if (currentTrack.type === 'youtube') {
+    if (!ytPlayer) { stashPending(true, position || 0, seq); return; }
     try {
       if (typeof position === 'number' && Math.abs(ytPlayer.getCurrentTime() - position) > SYNC_DRIFT)
         ytPlayer.seekTo(position, true);
       applyVolume(); applySpeed();
       ytPlayer.playVideo();
     } catch (e) {}
-  } else if (currentTrack.type === 'soundcloud' && scPlayer) {
+  } else if (currentTrack.type === 'soundcloud') {
+    if (!scPlayer) { stashPending(true, position || 0, seq); return; }
     if (typeof position === 'number' && Math.abs(scLastPos - position) > SYNC_DRIFT) {
       scPlayer.seekTo(position * 1000); scActionAt = Date.now();
     }
@@ -723,17 +819,19 @@ function doPlay(position) {
     scPlayer.play();
   }
 }
-function doPause(position) {
+function doPause(position, seq) {
   if (!currentTrack) return;
   if (currentTrack.type === 'audio') {
     if (typeof position === 'number') { try { audio.currentTime = position; } catch (e) {} }
     audio.pause();
-  } else if (currentTrack.type === 'youtube' && ytPlayer) {
+  } else if (currentTrack.type === 'youtube') {
+    if (!ytPlayer) { stashPending(false, position || 0, seq); return; }
     try {
       if (typeof position === 'number') ytPlayer.seekTo(position, true);
       ytPlayer.pauseVideo();
     } catch (e) {}
-  } else if (currentTrack.type === 'soundcloud' && scPlayer) {
+  } else if (currentTrack.type === 'soundcloud') {
+    if (!scPlayer) { stashPending(false, position || 0, seq); return; }
     try {
       if (typeof position === 'number') scPlayer.seekTo(position * 1000);
       scActionAt = Date.now();
@@ -741,32 +839,50 @@ function doPause(position) {
     } catch (e) {}
   }
 }
-function doSeek(position) {
+function doSeek(position, seq) {
   if (!currentTrack || typeof position !== 'number') return;
   if (currentTrack.type === 'audio') { try { audio.currentTime = position; } catch (e) {} }
-  else if (currentTrack.type === 'youtube' && ytPlayer) { try { ytPlayer.seekTo(position, true); } catch (e) {} }
-  else if (currentTrack.type === 'soundcloud' && scPlayer) {
+  else if (currentTrack.type === 'youtube') {
+    if (!ytPlayer) { stashPending(true, position, seq); return; }
+    try { ytPlayer.seekTo(position, true); } catch (e) {}
+  } else if (currentTrack.type === 'soundcloud') {
+    if (!scPlayer) { stashPending(true, position, seq); return; }
     scActionAt = Date.now();
     try { scPlayer.seekTo(position * 1000); } catch (e) {}
   }
 }
 function emitEnded() {
-  // advance the shared queue instead of just pausing everyone at 0
-  if (!suppress && socket && currentTrack) socket.emit('track-ended');
+  // An 'ended' we caused (swapping tracks) must not advance the queue, and
+  // there is no seq on this event to let the server decide — so it is simply
+  // dropped when it is ours.
+  const ours = echo.consumeDrop('ended');
+  if (!ours && socket && currentTrack) socket.emit('track-ended');
   setPlayingUI(false);
 }
 
 // audio -> server
-audio.addEventListener('play', () => { if (!suppress && socket) socket.emit('play', audio.currentTime); });
+audio.addEventListener('play', () => emitControl('play', 'play', audio.currentTime));
 audio.addEventListener('pause', () => {
-  if (!suppress && socket && !audio.ended) socket.emit('pause', audio.currentTime);
+  if (audio.ended) return;
+  emitControl('pause', 'pause', audio.currentTime);
 });
-audio.addEventListener('seeked', () => { if (!suppress && socket) socket.emit('seek', audio.currentTime); });
+audio.addEventListener('seeked', () => emitControl('seeked', 'seek', audio.currentTime));
 audio.addEventListener('ended', emitEnded);
 
 // youtube
-function loadYouTube(videoId) {
-  if (!ytReady) { setTimeout(() => loadYouTube(videoId), 300); return; }
+let ytLoadToken = 0;
+function loadYouTube(videoId, attempt) {
+  attempt = attempt || 0;
+  const token = ++ytLoadToken;
+  if (!ytReady) {
+    // The iframe API is a third-party script. Retrying keeps the player
+    // usable when it is merely slow, but without a cap this would spin
+    // forever when it is blocked — and without the token a retry queued for
+    // an older video would clobber the one the user just picked.
+    if (attempt >= 100) { setStatus('یوتیوب لود نشد — اینترنتت رو چک کن'); return; }
+    setTimeout(() => { if (token === ytLoadToken) loadYouTube(videoId, attempt + 1); }, 300);
+    return;
+  }
   if (!ytPlayer) {
     ytPlayer = new YT.Player('ytPlayer', {
       videoId,
@@ -779,7 +895,7 @@ function loadYouTube(videoId) {
             withSuppress(() => {
               doSeek(p.position);
               if (p.isPlaying) doPlay(p.position); else doPause(p.position);
-            });
+            }, ['play', 'pause', 'seeked'], p.seq);
           }
         },
         onStateChange: onYtStateChange,
@@ -792,24 +908,35 @@ function loadYouTube(videoId) {
 function onYtStateChange(e) {
   if (e.data === YT.PlayerState.PLAYING) setPlayingUI(true);
   else if (e.data === YT.PlayerState.PAUSED || e.data === YT.PlayerState.ENDED) setPlayingUI(false);
-  if (suppress || !socket) return;
-  if (e.data === YT.PlayerState.PLAYING) socket.emit('play', ytPlayer.getCurrentTime());
-  else if (e.data === YT.PlayerState.PAUSED) socket.emit('pause', ytPlayer.getCurrentTime());
+  if (!socket) return;
+  if (e.data === YT.PlayerState.PLAYING) emitControl('play', 'play', ytPlayer.getCurrentTime());
+  else if (e.data === YT.PlayerState.PAUSED) emitControl('pause', 'pause', ytPlayer.getCurrentTime());
   else if (e.data === YT.PlayerState.ENDED) emitEnded();
 }
 window.onYouTubeIframeAPIReady = () => { ytReady = true; };
 if (typeof YT !== 'undefined' && YT.loaded) ytReady = true;
 
 // soundcloud
-function loadSoundCloud(url) {
+let scLoadToken = 0;
+function loadSoundCloud(url, attempt) {
+  attempt = attempt || 0;
+  const token = ++scLoadToken;
+  // Check the API BEFORE touching the iframe: the old code rebuilt the
+  // iframe on every retry, so a slow api.js reloaded the embed forever, and a
+  // retry left over from the previous track would replace the new one.
+  if (typeof SC === 'undefined' || !SC.Widget) {
+    if (attempt >= 100) { setStatus('ساندکلاد لود نشد — اینترنتت رو چک کن'); return; }
+    setTimeout(() => { if (token === scLoadToken) loadSoundCloud(url, attempt + 1); }, 300);
+    return;
+  }
   scReady = false; scDuration = 0;
   const src = 'https://w.soundcloud.com/player/?url=' + encodeURIComponent(url) +
     '&auto_play=false&show_comments=false&visual=true';
   scWrap.innerHTML = '<iframe id="scIframe" width="100%" height="166" scrolling="no" ' +
     'frameborder="no" allow="autoplay" src="' + src + '"></iframe>';
-  if (typeof SC === 'undefined' || !SC.Widget) { setTimeout(() => loadSoundCloud(url), 300); return; }
   scPlayer = SC.Widget(document.getElementById('scIframe'));
   scPlayer.bind(SC.Widget.Events.READY, () => {
+    if (token !== scLoadToken) return; // a newer track already took over
     scReady = true;
     try { scPlayer.getDuration((ms) => { scDuration = (ms || 0) / 1000; }); } catch (e) {}
     try { scPlayer.setVolume(volume); } catch (e) {}
@@ -818,22 +945,24 @@ function loadSoundCloud(url) {
       withSuppress(() => {
         doSeek(p.position);
         if (p.isPlaying) doPlay(p.position); else doPause(p.position);
-      });
+      }, ['play', 'pause', 'seeked'], p.seq);
     }
     scPlayer.bind(SC.Widget.Events.PLAY_PROGRESS, (ev) => { scLastPos = ev.currentPosition / 1000; });
     scPlayer.bind(SC.Widget.Events.PLAY, () => {
       scPlaying = true; setPlayingUI(true);
       try { scPlayer.getDuration((ms) => { scDuration = (ms || 0) / 1000; }); } catch (e) {}
-      if (suppress || !socket) return;
-      scPlayer.getPosition((ms) => socket.emit('play', ms / 1000));
+      if (!socket) return;
+      const c = echo.resolve('play'); // decide now, the value arrives async
+      scPlayer.getPosition((ms) => { if (c.send) socket.emit('play', ms / 1000, c.seq); });
     });
     scPlayer.bind(SC.Widget.Events.PAUSE, () => {
       const wasPlaying = scPlaying;
       scPlaying = false; setPlayingUI(false);
       if (!wasPlaying) return;
       if (Date.now() - scActionAt < SC_ECHO_MS) return;
-      if (suppress || !socket) return;
-      scPlayer.getPosition((ms) => socket.emit('pause', ms / 1000));
+      if (!socket) return;
+      const c = echo.resolve('pause');
+      scPlayer.getPosition((ms) => { if (c.send) socket.emit('pause', ms / 1000, c.seq); });
     });
     scPlayer.bind(SC.Widget.Events.FINISH, emitEnded);
   });
@@ -841,23 +970,20 @@ function loadSoundCloud(url) {
 
 // ============================================================ socket events
 function bindSocket(s) {
-  s.on('room-users', (n) => { userCount.textContent = n; });
   s.on('members', (list) => {
     lastMembers = Array.isArray(list) ? list : [];
-    const hostEntry = lastMembers.find((m) => m.isHost);
-    if (hostEntry) lastHostId = hostEntry.userId;
     // paintMembers derives myRole/amHost from our own entry — host
     // transfers and role flips arrive here, not only via full state.
-    paintMembers(lastMembers, lastHostId, djOnly);
+    paintMembers(lastMembers, djOnly);
   });
   s.on('load-track', (track) => {
     loadTrack(track);
     if (track) setStatus('آهنگ جدید: ' + (track.title || '') + ' — از ' + ((track.addedBy && track.addedBy.username) || '؟'));
     else setStatus('صف تمام شد.');
   });
-  s.on('play', (p) => withSuppress(() => doPlay(p)));
-  s.on('pause', (p) => withSuppress(() => doPause(p)));
-  s.on('seek', (p) => withSuppress(() => doSeek(p)));
+  s.on('play', (p, seq) => withSuppress(() => doPlay(p, seq), ['play', 'seeked'], seq));
+  s.on('pause', (p, seq) => withSuppress(() => doPause(p, seq), ['pause', 'seeked'], seq));
+  s.on('seek', (p, seq) => withSuppress(() => doSeek(p, seq), ['seeked'], seq));
   s.on('queue-update', paintQueue);
   s.on('history-update', paintHistory);
   s.on('speed-change', (v) => applyRoomSpeed(v));
@@ -866,9 +992,8 @@ function bindSocket(s) {
   s.on('room-flags', (f) => {
     if (!f) return;
     djOnly = !!f.djOnly;
-    if (f.hostId) lastHostId = f.hostId;
     // hostship itself comes from members (isHost flag) — never guess it
-    paintMembers(lastMembers, lastHostId, djOnly);
+    paintMembers(lastMembers, djOnly);
   });
   // Server rotated the host token (grace-period transfer): store it so
   // this browser can reclaim hostship later.
@@ -876,19 +1001,18 @@ function bindSocket(s) {
     if (d && d.code && d.token) saveHostToken(d.code, d.token);
   });
   s.on('kicked', (d) => {
-    if (d && d.code) saveHostToken(d.code, null);
+    if (d && d.code) { saveHostToken(d.code, null); saveOwnerSecret(d.code, null); }
     resetRoomUI();
     history.replaceState(null, '', location.pathname);
     showOnly(lobby);
     lobbyError.textContent = 'هاست تو را از اتاق بیرون کرد';
   });
 }
-let lastHostId = null, lastMembers = [];
+let lastMembers = [];
 
 function applyFullState(st) {
-  lastHostId = st.hostId || null;
   lastMembers = st.members || [];
-  paintMembers(st.members, st.hostId, st.djOnly);
+  paintMembers(st.members, st.djOnly);
   applyRoomSpeed(st.speed || 1);
   paintQueue(st.queue);
   paintHistory(st.history);
@@ -897,11 +1021,11 @@ function applyFullState(st) {
   if (st.track) {
     loadTrack(st.track);
     const needWait = st.track.type === 'youtube' ? !ytPlayer : st.track.type === 'soundcloud' ? !scPlayer : false;
-    if (needWait) { pending = { isPlaying: st.isPlaying, position: st.position }; return; }
+    if (needWait) { stashPending(st.isPlaying, st.position, st.seq); return; }
     withSuppress(() => {
-      doSeek(st.position);
-      if (st.isPlaying) doPlay(st.position); else doPause(st.position);
-    });
+      doSeek(st.position, st.seq);
+      if (st.isPlaying) doPlay(st.position, st.seq); else doPause(st.position, st.seq);
+    }, ['play', 'pause', 'seeked'], st.seq);
   } else {
     loadTrack(null);
   }
@@ -910,27 +1034,85 @@ function applyFullState(st) {
 function autoRejoin() {
   const code = (location.hash || '').replace('#', '').toUpperCase().trim();
   if (!code || !socket) return;
-  socket.emit('join-room', code, { hostToken: getHostToken(code) }, (res) => {
-    if (!res || !res.ok) { history.replaceState(null, '', location.pathname); return; }
+  socket.emit('join-room', code, {
+    hostToken: getHostToken(code),
+    ownerSecret: getOwnerSecret(code),
+  }, (res) => {
+    if (!res || !res.ok) {
+      const err = res && res.error;
+      // Transient: keep the hash so the next reconnect retries, otherwise the
+      // room is dropped from the address bar and rejoining is impossible.
+      if (err === 'rate-limited') {
+        if (!currentCode) lobbyError.textContent = 'خیلی سریع — چند لحظه صبر کن';
+        return;
+      }
+      history.replaceState(null, '', location.pathname);
+      if (currentCode) { resetRoomUI(); showOnly(lobby); }
+      // Opening an invite to a room that has since expired used to drop you
+      // into the lobby with no explanation at all.
+      lobbyError.textContent = err === 'banned'
+        ? 'هاست تو را از اتاق بیرون کرد'
+        : 'اتاق ' + code + ' دیگه موجود نیست';
+      return;
+    }
     onEnteredRoom(res);
   });
 }
 
-// heartbeat: drift fix + autoplay-block recovery
+// Editing the hash (pasting another invite, hitting back) now actually moves
+// you between rooms — previously only a fresh page load read it.
+window.addEventListener('hashchange', () => {
+  if (!socket) return;
+  const want = (location.hash || '').replace('#', '').toUpperCase().trim();
+  if (want === currentCode) return;
+  if (!want) { if (currentCode) leaveBtn.click(); return; }
+  if (!/^[A-Z0-9]{5}$/.test(want)) return;
+  if (currentCode) { socket.emit('leave-room'); resetRoomUI(); }
+  showOnly(lobby);
+  doJoin(want, listenerCheck.checked);
+});
+
+// heartbeat: drift fix + autoplay-block recovery, in BOTH directions.
+// Only ever correcting "should be playing" meant a missed 'pause' left one
+// client audible until somebody touched the controls again.
+function locallyPlaying() {
+  if (!currentTrack) return false;
+  if (currentTrack.type === 'audio') return !audio.paused && !audio.ended;
+  if (currentTrack.type === 'youtube') {
+    try {
+      return !!(ytPlayer && ytPlayer.getPlayerState &&
+        ytPlayer.getPlayerState() === YT.PlayerState.PLAYING);
+    } catch (e) { return false; }
+  }
+  if (currentTrack.type === 'soundcloud') return scReady && scPlaying;
+  return false;
+}
+// distinct from !locallyPlaying(): a track that simply ran out is not a
+// "should be playing" failure the heartbeat ought to re-fire
+function locallyPaused() {
+  if (!currentTrack) return false;
+  if (currentTrack.type === 'audio') return audio.paused && !audio.ended;
+  if (currentTrack.type === 'youtube') {
+    try {
+      return !!(ytPlayer && ytPlayer.getPlayerState &&
+        ytPlayer.getPlayerState() === YT.PlayerState.PAUSED);
+    } catch (e) { return false; }
+  }
+  if (currentTrack.type === 'soundcloud') return !!(scPlayer && scReady && !scPlaying);
+  return false;
+}
 setInterval(() => {
   if (!socket || !currentTrack) return;
-  socket.emit('sync-request', (state) => {
+  socket.emit('ping-state', (state) => {
     if (!state || !state.track) return;
+    // speed is shared too; re-applying it also snaps a denied change back
+    if (state.speed && state.speed !== speed) applyRoomSpeed(state.speed);
     if (state.isPlaying) {
-      const locallyPaused =
-        (currentTrack.type === 'audio' && audio.paused && !audio.ended) ||
-        (currentTrack.type === 'youtube' && ytPlayer && ytPlayer.getPlayerState && (() => {
-          try { return ytPlayer.getPlayerState() === YT.PlayerState.PAUSED; } catch (e) { return false; }
-        })()) ||
-        (currentTrack.type === 'soundcloud' && scPlayer && scReady && !scPlaying);
-      if (locallyPaused) { withSuppress(() => doPlay(state.position)); return; }
+      if (locallyPaused()) { withSuppress(() => doPlay(state.position, state.seq), ['play', 'seeked'], state.seq); return; }
       if (Math.abs(getPosition() - state.position) > SYNC_DRIFT)
-        withSuppress(() => doSeek(state.position));
+        withSuppress(() => doSeek(state.position, state.seq), ['seeked'], state.seq);
+    } else if (locallyPlaying()) {
+      withSuppress(() => doPause(state.position, state.seq), ['pause', 'seeked'], state.seq);
     }
   });
 }, 5000);
