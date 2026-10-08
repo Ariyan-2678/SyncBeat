@@ -4,25 +4,23 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="theme-color" content="#101511" />
-  <title>SyncBeat Forest — گوش‌دادن هماهنگ به موسیقی</title>
+  <title>SyncBeat — گوش‌دادن هماهنگ به موسیقی</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="style.css" />
   <script>
-    // Apply the saved theme before first paint to avoid a flash.
     (function () {
       try {
         var t = localStorage.getItem('sb-theme');
         if (!t) t = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
         document.documentElement.setAttribute('data-theme', t);
-      } catch (e) { /* default stays dark */ }
+      } catch (e) { }
     })();
   </script>
 </head>
 <body>
 
-  <!-- Ambient aurora backdrop -->
   <div class="sky" aria-hidden="true">
     <div class="aurora aurora-a"></div>
     <div class="aurora aurora-b"></div>
@@ -30,27 +28,49 @@
     <div class="stars"></div>
     <div class="grain"></div>
   </div>
+  <div id="reactionLayer" class="reaction-layer" aria-hidden="true"></div>
 
   <header class="topbar">
     <a class="brand" href="/" aria-label="SyncBeat — صفحه اصلی">
       <span class="brand-mark" aria-hidden="true"><span class="disc"></span></span>
       <span class="brand-name">Sync<em>Beat</em></span>
     </a>
-    <button id="themeToggle" class="icon-btn" type="button" aria-label="تغییر پوسته روشن / تاریک" title="تغییر پوسته">
-      <svg class="ico-sun" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
-        <circle cx="12" cy="12" r="4.2"/>
-        <path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M4.9 4.9l1.6 1.6M17.5 17.5l1.6 1.6M19.1 4.9l-1.6 1.6M6.5 17.5l-1.6 1.6"/>
-      </svg>
-      <svg class="ico-moon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M20.2 14.5A8.3 8.3 0 0 1 9.5 3.8a8.3 8.3 0 1 0 10.7 10.7Z"/>
-      </svg>
-    </button>
+    <div class="top-actions">
+      <div id="userChip" class="user-chip hidden">
+        <span id="userAvatar" class="avatar">؟</span>
+        <span id="userName" class="uname"></span>
+        <button id="logoutBtn" class="chip-btn" type="button">تغییر اسم</button>
+      </div>
+      <button id="themeToggle" class="icon-btn" type="button" aria-label="تغییر پوسته" title="تغییر پوسته">
+        <svg class="ico-sun" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+          <circle cx="12" cy="12" r="4.2"/>
+          <path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M4.9 4.9l1.6 1.6M17.5 17.5l1.6 1.6M19.1 4.9l-1.6 1.6M6.5 17.5l-1.6 1.6"/>
+        </svg>
+        <svg class="ico-moon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M20.2 14.5A8.3 8.3 0 0 1 9.5 3.8a8.3 8.3 0 1 0 10.7 10.7Z"/>
+        </svg>
+      </button>
+    </div>
   </header>
 
   <main class="app">
 
+    <!-- ============ Guest entry ============ -->
+    <section id="auth" class="panel auth hidden">
+      <p class="eyebrow">ورود مهمان</p>
+      <h1 class="hero-title">اول بگو <span class="grad">کی هستی</span></h1>
+      <p class="sub">یه اسم بنویس تا بقیه بفهمن کیه — بدون ثبت‌نام و رمز.</p>
+      <form id="authForm" class="auth-form" autocomplete="on">
+        <input id="guestName" maxlength="20" placeholder="اسمت (۲ تا ۲۰ حرف)" autocomplete="nickname" aria-label="اسم" />
+        <div class="auth-row">
+          <button id="guestEnter" class="btn primary btn-lg" type="submit">ورود به‌عنوان مهمان</button>
+        </div>
+      </form>
+      <p id="authError" class="error" role="alert"></p>
+    </section>
+
     <!-- ============ Lobby ============ -->
-    <section id="lobby" class="panel lobby rise-in">
+    <section id="lobby" class="panel lobby hidden">
       <p class="eyebrow">پخش هماهنگ · MP3 · یوتیوب · ساندکلاد</p>
       <h1 class="hero-title">موسیقی، <span class="grad">هم‌زمان</span> با هم.</h1>
       <p class="sub">یه اتاق بساز یا با کد وارد شو؛ هرچی پخش بشه برای همه دقیقاً هم‌زمان و هم‌گام پخش می‌شه.</p>
@@ -69,10 +89,14 @@
                autocapitalize="characters" spellcheck="false" autocomplete="off" aria-label="کد ۵ حرفی اتاق" />
         <button id="joinBtn" class="btn btn-lg" type="button">ورود به اتاق</button>
       </form>
+      <label class="check-row">
+        <input id="listenerCheck" type="checkbox" />
+        ورود به‌عنوان شنونده (فقط گوش + چت، بدون کنترل پخش)
+      </label>
       <p id="lobbyError" class="error" role="alert"></p>
 
       <ul class="hints">
-        <li><span class="hint-dot d1"></span>هرکی توی اتاقه می‌تونه آهنگ بذاره</li>
+        <li><span class="hint-dot d1"></span>هرکی توی اتاقه می‌تونه آهنگ به صف اضافه کنه</li>
         <li><span class="hint-dot d2"></span>پلی، پاز و جابه‌جایی برای همه هم‌گامه</li>
         <li><span class="hint-dot d3"></span>با لینک مستقیم MP3 یا یوتیوب یا ساندکلاد</li>
       </ul>
@@ -86,27 +110,34 @@
           <span class="code-label">کد اتاق</span>
           <span id="roomCode" class="code latin">·····</span>
           <button id="copyBtn" class="chip-btn" type="button" title="کپی کد اتاق" aria-label="کپی کد اتاق">
-            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <rect x="9" y="9" width="11" height="11" rx="2.5"/>
-              <path d="M5 15H4.5A1.5 1.5 0 0 1 3 13.5v-9A1.5 1.5 0 0 1 4.5 3h9A1.5 1.5 0 0 1 15 4.5V5"/>
-            </svg>
             <span class="copy-label">کپی</span>
           </button>
+          <button id="shareBtn" class="chip-btn" type="button" title="اشتراک لینک دعوت">دعوت</button>
         </div>
-        <div class="users-pill" title="تعداد افراد آنلاین در اتاق">
+        <div class="users-pill" title="افراد آنلاین">
           <span class="pulse-dot" aria-hidden="true"></span>
           <span id="userCount">1</span>&nbsp;نفر آنلاین
         </div>
+        <button id="leaveBtn" class="chip-btn" type="button" title="خروج از اتاق">خروج از اتاق</button>
+      </div>
+
+      <div id="inviteBox" class="invite hidden">
+        <input id="inviteLink" dir="ltr" readonly aria-label="لینک دعوت" />
+        <img id="qrImg" width="120" height="120" alt="QR دعوت" />
+      </div>
+
+      <div id="membersBox" class="members">
+        <p class="box-title">حاضران <span id="djBadge" class="dj-badge hidden">فقط DJ (هاست) کنترل می‌کند</span></p>
+        <ul id="membersList" class="members-list"></ul>
+        <label id="djRow" class="check-row hidden">
+          <input id="djCheck" type="checkbox" />
+          فقط هاست (DJ) پخش را کنترل کند
+        </label>
       </div>
 
       <form id="trackForm" class="track-input" autocomplete="off">
         <input id="trackUrl" dir="ltr" placeholder="لینک آهنگ (MP3 / یوتیوب / ساندکلاد)…" aria-label="لینک آهنگ" />
-        <button id="loadBtn" class="btn primary" type="button">
-          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/>
-          </svg>
-          لود آهنگ
-        </button>
+        <button id="loadBtn" class="btn primary" type="button">▶ پخش</button>
       </form>
 
       <div id="playerWrap" class="player-wrap">
@@ -115,7 +146,12 @@
             <span class="wave w1"></span><span class="wave w2"></span><span class="wave w3"></span><span class="wave w4"></span><span class="wave w5"></span>
           </div>
           <p class="empty-title">هنوز چیزی در حال پخش نیست</p>
-          <p class="empty-sub">یه لینک آهنگ بذار تا همین‌جا برای همه شروع شه.</p>
+          <p class="empty-sub">یه لینک بذار تا بره تو صف و پخش شه.</p>
+        </div>
+
+        <div id="trackMeta" class="track-meta hidden">
+          <p id="trackTitle" class="track-title"></p>
+          <p id="trackBy" class="track-by"></p>
         </div>
 
         <audio id="audio" class="hidden" preload="auto"></audio>
@@ -127,7 +163,7 @@
         <div id="scWrap" class="sc-frame hidden"></div>
       </div>
 
-      <!-- Custom transport bar for direct-MP3 tracks -->
+      <!-- Unified transport for ALL track types -->
       <div id="transport" class="transport hidden">
         <button id="playPauseBtn" class="play-btn" type="button" aria-label="پخش / توقف">
           <svg class="ico-play" viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true">
@@ -138,9 +174,52 @@
             <rect x="13.5" y="5" width="4" height="14" rx="1.4"/>
           </svg>
         </button>
-        <span id="timeCur" class="time latin">0:00</span>
-        <input id="seekBar" class="seek" type="range" min="0" max="1000" value="0" step="1" aria-label="جابه‌جایی در آهنگ" />
-        <span id="timeDur" class="time latin">0:00</span>
+        <button id="nextBtn" class="chip-btn" type="button" title="آهنگ بعدی">⏭ بعدی</button>
+        <div class="scrub">
+          <span id="timeCur" class="time latin">0:00</span>
+          <input id="seekBar" class="seek" type="range" min="0" max="1000" value="0" step="1" aria-label="جابه‌جایی در آهنگ" />
+          <span id="timeDur" class="time latin">0:00</span>
+        </div>
+        <button id="muteBtn" class="chip-btn" type="button" title="بی‌صدا">🔊</button>
+        <input id="volBar" class="vol" type="range" min="0" max="100" value="90" aria-label="بلندی صدا" />
+        <select id="speedSel" class="speed" aria-label="سرعت پخش">
+          <option value="0.75">0.75×</option>
+          <option value="1" selected>1×</option>
+          <option value="1.25">1.25×</option>
+          <option value="1.5">1.5×</option>
+          <option value="2">2×</option>
+        </select>
+      </div>
+
+      <div class="reactions">
+        <button type="button" data-emoji="❤️">❤️</button>
+        <button type="button" data-emoji="🔥">🔥</button>
+        <button type="button" data-emoji="👏">👏</button>
+        <button type="button" data-emoji="😂">😂</button>
+        <button type="button" data-emoji="🎵">🎵</button>
+        <button type="button" data-emoji="👎">👎</button>
+      </div>
+
+      <div class="queue-box">
+        <div class="queue-head">
+          <p class="box-title">صف بعدی (<span id="queueCount">0</span>)</p>
+          <button id="clearQueueBtn" class="chip-btn hidden" type="button">پاک‌سازی (هاست)</button>
+        </div>
+        <ol id="queueList" class="queue-list"></ol>
+      </div>
+
+      <div id="historyBox" class="history-box hidden">
+        <p class="box-title">تاریخچه</p>
+        <ol id="historyList" class="history-list"></ol>
+      </div>
+
+      <div class="chat-box">
+        <p class="box-title">چت اتاق</p>
+        <ul id="chatList" class="chat-list"></ul>
+        <form id="chatForm" class="chat-row" autocomplete="off">
+          <input id="chatInput" maxlength="500" placeholder="پیام بنویس…" aria-label="متن چت" />
+          <button class="btn primary" type="submit">ارسال</button>
+        </form>
       </div>
 
       <div id="status" class="status" role="status" aria-live="polite"></div>

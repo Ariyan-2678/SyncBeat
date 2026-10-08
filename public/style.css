@@ -392,7 +392,6 @@ input:focus {
 #codeInput::placeholder { letter-spacing: .3em; font-weight: 500; }
 
 .join-row, .track-input { display: flex; gap: 10px; }
-.track-input { margin-bottom: 22px; }
 
 .error {
   color: var(--error);
@@ -439,7 +438,6 @@ input:focus {
   align-items: center;
   flex-wrap: wrap;
   gap: 12px;
-  margin-bottom: 24px;
 }
 .code-chip {
   display: inline-flex;
@@ -540,6 +538,15 @@ audio { width: 100%; }
   border: 1px solid var(--hairline);
   box-shadow: 0 18px 50px -20px rgba(0, 0, 0, .55);
 }
+/* Soft skeleton behind the frame until the YouTube iframe paints. */
+.media-frame::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    repeating-linear-gradient(115deg, rgba(127, 174, 114, .07) 0 10px, transparent 10px 24px),
+    var(--field);
+}
 .media-frame #ytPlayer,
 .media-frame iframe {
   position: absolute;
@@ -554,9 +561,9 @@ audio { width: 100%; }
 /* ---------- Transport bar (custom MP3 controls) ---------- */
 .transport {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 14px;
-  margin-top: 18px;
+  gap: 12px;
   padding: 12px 16px;
   border: 1px solid var(--hairline);
   border-radius: var(--r-md);
@@ -581,6 +588,14 @@ audio { width: 100%; }
 .transport.playing .play-btn .ico-play { display: none; }
 .transport.playing .play-btn .ico-pause { display: block; }
 
+.scrub {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 240px;
+  min-width: 0;
+}
+
 .time {
   font-size: 12.5px;
   color: var(--text-3);
@@ -592,6 +607,7 @@ audio { width: 100%; }
 
 .seek {
   flex: 1;
+  min-width: 100px;
   appearance: none;
   -webkit-appearance: none;
   height: 5px;
@@ -623,17 +639,34 @@ audio { width: 100%; }
 .seek::-moz-range-progress { background: var(--accent); height: 5px; border-radius: 99px; }
 .seek::-moz-range-track { background: var(--hairline-strong); height: 5px; border-radius: 99px; }
 
-/* ---------- Status toast ---------- */
+/* ---------- Status toast (always visible) ---------- */
 .status {
-  margin-top: 16px;
-  min-height: 20px;
+  position: fixed;
+  top: 78px;
+  left: 50%;
+  transform: translateX(-50%) translateY(-8px);
+  z-index: 60;
+  max-width: min(86vw, 440px);
+  padding: 9px 18px;
+  border: 1px solid var(--hairline-strong);
+  border-radius: 999px;
+  background: var(--glass);
+  backdrop-filter: blur(16px) saturate(150%);
+  -webkit-backdrop-filter: blur(16px) saturate(150%);
+  box-shadow: var(--shadow);
+  color: var(--text-2);
+  font-size: 13.5px;
+  font-weight: 500;
   text-align: center;
-  color: var(--text-3);
-  font-size: 13px;
-  font-weight: 400;
-  transition: color .3s ease;
+  line-height: 1.6;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .35s ease, transform .35s var(--ease);
 }
-.status.flash { color: var(--accent); }
+.status.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
 
 /* ---------- Footer ---------- */
 .credit {
@@ -671,8 +704,8 @@ audio { width: 100%; }
   .join-row .btn { width: 100%; }
   .room-head { flex-direction: column; align-items: stretch; }
   .code-chip, .users-pill { justify-content: center; }
-  .transport { flex-wrap: wrap; row-gap: 10px; }
-  .seek { order: 3; flex-basis: 100%; }
+  .transport { gap: 10px 12px; }
+  .scrub { order: 5; flex: 1 1 100%; }
   .time { min-width: 38px; }
 }
 
@@ -698,4 +731,223 @@ body.playing .brand-mark .disc { animation: disc-spin 3.5s linear infinite; }
 }
 @media (prefers-reduced-motion: reduce) {
   body.playing .aurora { opacity: .5; }
+}
+
+/* ---------- v2: auth / members / queue / chat / reactions ---------- */
+.top-actions { display: flex; align-items: center; gap: 10px; }
+.user-chip {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 6px 8px 6px 12px; border: 1px solid var(--hairline);
+  border-radius: 999px; background: var(--field);
+  font-size: 13px; font-weight: 600;
+}
+.avatar {
+  width: 28px; height: 28px; border-radius: 50%;
+  display: inline-grid; place-items: center;
+  background: var(--a1); color: #fff; font-weight: 800; font-size: 14px;
+  flex-shrink: 0;
+}
+.avatar.sm { width: 24px; height: 24px; font-size: 12px; }
+.auth-form { display: grid; gap: 10px; }
+.auth-form input[type="password"], .auth-form input:not([type]) { width: 100%; }
+.auth-row { display: flex; gap: 10px; }
+.auth-row .btn { flex: 1; }
+.check-row {
+  display: flex; align-items: center; gap: 8px;
+  margin-top: 12px; font-size: 13.5px; color: var(--text-2); cursor: pointer;
+}
+.check-row input { width: 16px; height: 16px; accent-color: var(--a1); }
+.box-title { font-size: 13px; font-weight: 700; color: var(--text-2); margin: 0 0 8px; }
+/* ---------- Room grid: one column by default, two on desktop ---------- */
+.room {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas:
+    "head" "invite" "members" "form" "player"
+    "transport" "reactions" "queue" "history" "chat";
+}
+.room-head { grid-area: head; }
+.invite { grid-area: invite; }
+.members { grid-area: members; }
+.track-input { grid-area: form; }
+.player-wrap { grid-area: player; }
+.transport { grid-area: transport; }
+.reactions { grid-area: reactions; }
+.queue-box { grid-area: queue; }
+.history-box { grid-area: history; }
+.chat-box { grid-area: chat; }
+.members-list, .queue-list, .history-list, .chat-list {
+  list-style: none; margin: 0; padding: 0; display: grid;
+  gap: 8px; grid-template-columns: minmax(0, 1fr);
+}
+.m-item, .q-item, .h-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; border: 1px solid var(--hairline);
+  border-radius: var(--r-sm); background: var(--field); font-size: 13.5px;
+  min-width: 0;
+}
+.m-name, .q-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.q-type, .q-del, .m-badge { flex-shrink: 0; }
+.q-type {
+  font-family: "Space Grotesk", sans-serif; font-size: 11px; font-weight: 700;
+  padding: 2px 8px; border-radius: 999px; background: var(--glow); color: var(--accent);
+}
+.q-by {
+  font-size: 12px; color: var(--text-3);
+  min-width: 0; max-width: 45%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.q-empty { color: var(--text-3); font-size: 13px; text-align: center; padding: 8px; }
+.h-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px; border: 1px solid var(--hairline);
+  border-radius: var(--r-sm); background: var(--field); font-size: 13px;
+}
+.m-badge {
+  font-size: 11.5px; padding: 2px 8px; border-radius: 999px;
+  background: var(--glow); color: var(--accent);
+}
+.dj-badge {
+  font-size: 11px; padding: 2px 8px; border-radius: 999px;
+  background: var(--glow); color: var(--accent); margin-inline-start: 6px;
+}
+.queue-head { display: flex; align-items: center; justify-content: space-between; }
+.track-meta { margin-bottom: 12px; }
+.track-title { margin: 0 0 4px; font-weight: 800; font-size: 16px; }
+.track-by { margin: 0; font-size: 12.5px; color: var(--text-3); }
+.vol { width: 68px; accent-color: var(--accent); }
+.speed {
+  background: var(--field); color: var(--text); border: 1px solid var(--hairline);
+  border-radius: 8px; padding: 6px; font-family: inherit; font-size: 12.5px;
+}
+.reactions { display: flex; flex-wrap: wrap; gap: 8px; }
+.reactions button {
+  flex: 0 0 auto;
+  min-width: 48px;
+  font-size: 17px;
+  padding: 7px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--hairline); background: var(--field); cursor: pointer;
+  transition: transform .15s var(--ease);
+}
+.reactions button:hover { transform: scale(1.12); border-color: var(--accent); }
+.reaction-layer { position: fixed; inset: 0; pointer-events: none; z-index: 50; overflow: hidden; }
+.react-pop {
+  position: absolute; bottom: 12vh; font-size: 30px;
+  animation: react-up 2.2s ease-out forwards;
+}
+@keyframes react-up {
+  from { opacity: 0; transform: translateY(20px) scale(.6); }
+  15% { opacity: 1; transform: translateY(0) scale(1.15); }
+  to { opacity: 0; transform: translateY(-46vh) scale(1); }
+}
+.chat-list { max-height: 220px; overflow-y: auto; padding-inline-end: 4px; }
+.c-item { display: flex; gap: 8px; align-items: flex-start; font-size: 13.5px; min-width: 0; }
+.c-body { flex: 1; min-width: 0; background: var(--field); border: 1px solid var(--hairline); border-radius: var(--r-sm); padding: 7px 10px; }
+.c-head { display: flex; gap: 8px; align-items: baseline; font-weight: 700; font-size: 12.5px; }
+.c-time { font-weight: 400; color: var(--text-3); font-size: 11px; margin-inline-start: auto; }
+.c-text { display: block; margin-top: 2px; line-height: 1.9; word-break: break-word; }
+.chat-row { display: flex; gap: 8px; margin-top: 8px; }
+.chat-row input { flex: 1; }
+.invite {
+  display: flex; gap: 10px; align-items: center;
+  padding: 10px; border: 1px dashed var(--hairline-strong);
+  border-radius: var(--r-md);
+}
+.invite input { flex: 1; direction: ltr; }
+.invite img { border-radius: 8px; background: #fff; padding: 4px; }
+@media (max-width: 560px) {
+  .auth-row { flex-direction: column; }
+  .invite { flex-direction: column; }
+}
+
+/* ---------- Desktop: two columns - player, queue, chat & members all within reach ---------- */
+@media (min-width: 1000px) {
+  body.in-room .app { max-width: 1120px; }
+  .room {
+    grid-template-columns: minmax(0, 1fr) 330px;
+    column-gap: 24px;
+    grid-template-areas:
+      "head      head"
+      "invite    invite"
+      "form      members"
+      "player    members"
+      "transport members"
+      "reactions members"
+      "queue     chat"
+      "history   chat";
+  }
+  .members { align-self: start; }
+  .chat-box {
+    align-self: start;
+    position: sticky;
+    top: 14px;
+  }
+}
+
+/* ---------- Phone polish ---------- */
+@media (max-width: 560px) {
+  .topbar { padding: 14px 14px; gap: 8px; }
+  .brand { gap: 8px; min-width: 0; }
+  .brand-mark { width: 32px; height: 32px; }
+  .brand-name { font-size: 16px; }
+  .icon-btn { width: 36px; height: 36px; }
+  .icon-btn svg { width: 16px; height: 16px; }
+  .top-actions { gap: 6px; min-width: 0; }
+  .user-chip {
+    font-size: 12px; gap: 6px; padding: 4px 6px 4px 10px;
+    min-width: 0; max-width: 56vw;
+  }
+  .user-chip .avatar { width: 24px; height: 24px; font-size: 12px; }
+  .user-chip .uname { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .user-chip .chip-btn { padding: 5px 8px; font-size: 11.5px; white-space: nowrap; flex-shrink: 0; }
+
+  .app { padding: clamp(6px, 2vh, 20px) 12px 30px; }
+  .panel { padding: 20px 16px; }
+
+  .room-head { gap: 8px; }
+  .code-chip { gap: 8px; padding-inline: 12px 8px; }
+  .code-label { font-size: 11.5px; }
+  .code { font-size: 17px; letter-spacing: .12em; }
+  .users-pill { font-size: 12px; padding: 6px 10px; }
+  .chip-btn { padding: 6px 10px; font-size: 12.5px; }
+
+  .box-title { font-size: 12.5px; }
+  .m-item, .q-item { padding: 7px 9px; font-size: 13px; }
+  .h-item { padding: 5px 9px; font-size: 12.5px; }
+  .q-item .q-by { display: none; }
+  .q-by { max-width: 38%; }
+  .q-type { font-size: 10.5px; padding: 2px 7px; }
+
+  .track-title { font-size: 15px; }
+  .track-by { font-size: 12px; }
+  .empty-title { font-size: 15px; }
+  .empty-sub { font-size: 12.5px; }
+
+  .transport { gap: 8px; padding: 10px 12px; }
+  .play-btn { width: 42px; height: 42px; }
+  .vol { width: 56px; }
+  .speed { padding: 5px; font-size: 11.5px; }
+  .time { min-width: 36px; font-size: 12px; }
+
+  .reactions { gap: 6px; }
+  .reactions button { min-width: 42px; font-size: 16px; padding: 6px 11px; }
+
+  .hero-title { font-size: clamp(24px, 7.5vw, 32px); }
+  .sub { font-size: 14px; line-height: 1.9; margin-bottom: 24px; }
+  .btn { padding: 11px 18px; font-size: 14.5px; }
+  .btn-lg { padding: 13px 22px; font-size: 15px; }
+  .hints { margin-top: 20px; padding-top: 14px; gap: 9px; }
+  .hints li { font-size: 12.5px; }
+  .credit { font-size: 12.5px; padding: 14px 16px 22px; }
+  .status { font-size: 12.5px; padding: 8px 14px; max-width: calc(100vw - 28px); }
+
+  /* 16px inputs: iOS does not zoom the page when focusing fields */
+  input, select, textarea { font-size: 16px; }
+  .speed { font-size: 12.5px; }
+}
+
+@media (max-width: 480px) {
+  .brand-name { display: none; }
 }
