@@ -676,12 +676,14 @@ async function waitRunning(srv, label) {
   dataDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-test-proxy-'));
   // A stand-in for the YouTube Data API so the search handler's own code —
   // mapping, truncation, upstream failures — is exercised without a key.
+  let lastSearchQuery = '';
   const ytStub = http.createServer((req, res) => {
     const u = new URL(req.url, 'http://x');
     if (u.searchParams.get('q') === 'upstream-fail') {
       res.writeHead(500); res.end('nope'); return;
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
+    lastSearchQuery = req.url;
     res.end(JSON.stringify({ items: [
       { id: { videoId: 'dQw4w9WgXcQ' }, snippet: {
         title: 'A & B <script>', channelTitle: 'Someone',
@@ -740,6 +742,12 @@ async function waitRunning(srv, label) {
     if (items[1].title.length !== 140) fail('title should be capped at 140: ' + items[1].title.length);
     if (items[1].channel.length !== 60) fail('channel should be capped at 60: ' + items[1].channel.length);
     if (/^https:\/\//.test(items[1].thumb || '')) fail('a non-https thumbnail should be dropped: ' + items[1].thumb);
+    // Official music videos often have embedding switched off, and those
+    // cannot be played through the IFrame API at all — search must not offer
+    // them.
+    if (!/videoEmbeddable=true/.test(lastSearchQuery)) {
+      fail('search should only ask for embeddable videos: ' + lastSearchQuery);
+    }
   }
   const srFail = await searchAt(pbase, 'upstream-fail');
   if (srFail.status !== 502 || srFail.body.ok !== false) fail('an upstream failure should be a 502: ' + JSON.stringify(srFail));

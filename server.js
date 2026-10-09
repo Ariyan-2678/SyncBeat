@@ -231,8 +231,14 @@ app.get('/api/search', async (req, res) => {
   if (!rateOk('search:' + key, 30, 60000)) {
     return res.status(429).json({ ok: false, error: 'rate-limited' });
   }
+  // videoEmbeddable=true matters more than it looks: plenty of official music
+  // videos have embedding switched off by the label, and those cannot be
+  // played through the IFrame API at all — they show "watch this on YouTube"
+  // inside our player. Filtering here means search only offers what will
+  // actually play. A pasted link can still hit one; see onError in
+  // public/player.js.
   const url = YOUTUBE_API_BASE + '/youtube/v3/search' +
-    '?part=snippet&type=video&videoCategoryId=10&maxResults=8' +
+    '?part=snippet&type=video&videoCategoryId=10&videoEmbeddable=true&maxResults=8' +
     '&key=' + encodeURIComponent(YOUTUBE_API_KEY) +
     '&q=' + encodeURIComponent(q);
   let j;

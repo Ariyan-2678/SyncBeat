@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/smoke-client.js && node test/e2e.js"
+    "test": "node test/smoke-client.js && node test/e2e.js",
+    "test:browser": "node browser-check.js"
   },
   "engines": {
     "node": ">=22.5"

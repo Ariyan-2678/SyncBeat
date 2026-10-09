@@ -60,6 +60,7 @@ function loadTrack(track) {
   trackMeta.classList.remove('hidden');
   transport.classList.remove('hidden');
   trackTitle.textContent = track.title || track.url;
+  trackWarn.classList.add('hidden'); // a previous track's problem is not this one's
   trackBy.textContent = 'اضافه‌شده توسط ' + ((track.addedBy && track.addedBy.username) || '؟') +
     (track.type === 'youtube' ? ' · یوتیوب' : track.type === 'soundcloud' ? ' · ساندکلاد' : ' · MP3');
   const isAudio = track.type === 'audio', isYt = track.type === 'youtube', isSc = track.type === 'soundcloud';
@@ -199,12 +200,31 @@ function loadYouTube(videoId, attempt) {
           }
         },
         onStateChange: onYtStateChange,
+        onError: onYtError,
       },
     });
   } else {
     try { ytPlayer.cueVideoById(videoId); } catch (e) {}
   }
 }
+// Plenty of official music videos have embedding switched off by the label,
+// and those cannot be played through the IFrame API at all — YouTube renders
+// "This video is unavailable, watch this on YouTube" in its place. Say so in
+// words the room can act on, and offer the link, rather than leaving an
+// unexplained player that refuses to start.
+function onYtError(e) {
+  const id = currentTrack && currentTrack.type === 'youtube' ? currentTrack.url : null;
+  const where = id ? 'https://youtu.be/' + id : 'https://www.youtube.com';
+  const why = e && (e.data === 101 || e.data === 150)
+    ? 'صاحبِ این ویدیو پخشِ داخلی رو بسته. یه آپلودِ دیگه از همین آهنگ بذار، یا خودِ فایل رو آپلود کن.'
+    : e && (e.data === 100 || e.data === 103)
+      ? 'این ویدیو دیگه در دسترس نیست (حذف شده یا ادعاش شده).'
+      : 'یوتیوب این ویدیو رو پخش نکرد.';
+  trackWarn.innerHTML = esc(why) +
+    ' <a href="' + esc(where) + '" target="_blank" rel="noopener">باز کردن در یوتیوب ↗</a>';
+  trackWarn.classList.remove('hidden');
+}
+
 function onYtStateChange(e) {
   if (e.data === YT.PlayerState.PLAYING) setPlayingUI(true);
   else if (e.data === YT.PlayerState.PAUSED || e.data === YT.PlayerState.ENDED) setPlayingUI(false);
