@@ -803,7 +803,11 @@ body.playing .brand-mark .disc { animation: disc-spin 3.5s linear infinite; }
   min-width: 0;
 }
 .m-name, .q-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.q-type, .q-del, .m-badge { flex-shrink: 0; }
+.q-type, .q-tools, .m-badge { flex-shrink: 0; }
+.q-tools { display: inline-flex; gap: 5px; align-items: center; }
+.q-tools .chip-btn { padding: 3px 8px; font-size: 11.5px; }
+.q-vote.on { color: var(--error); border-color: currentColor; }
+.queue-actions { display: inline-flex; gap: 8px; align-items: center; }
 .q-type {
   font-family: "Space Grotesk", sans-serif; font-size: 11px; font-weight: 700;
   padding: 2px 8px; border-radius: 999px; background: var(--glow); color: var(--accent);
@@ -932,6 +936,7 @@ body.playing .brand-mark .disc { animation: disc-spin 3.5s linear infinite; }
   .m-item, .q-item { padding: 7px 9px; font-size: 13px; }
   .h-item { padding: 5px 9px; font-size: 12.5px; }
   .q-item .q-by { display: none; }
+  .q-tools .narrow { display: none; }
   .q-by { max-width: 38%; }
   .q-type { font-size: 10.5px; padding: 2px 7px; }
 

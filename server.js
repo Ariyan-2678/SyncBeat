@@ -363,6 +363,7 @@ const rooms = {};
       isPlaying: false, // never resume playing after a restart
       position: typeof s.position === 'number' ? s.position : 0,
       seq: 0,
+      queueSort: s.queueSort === 'votes' ? 'votes' : 'added',
       passwordHash: s.passwordHash || null,
       passwordSalt: s.passwordSalt || null,
       updatedAt: Date.now(),
@@ -425,6 +426,7 @@ function roomState(room) {
     speed: VALID_SPEEDS.includes(room.speed) ? room.speed : 1,
     // only a boolean: the hash never leaves the server
     private: !!room.passwordHash,
+    queueSort: room.queueSort === 'votes' ? 'votes' : 'added',
     seq: room.seq || 0,
   };
 }
@@ -493,7 +495,21 @@ function makeTrackItem(input, title, user) {
       ownerId: user.ownerTag, // hash — safe to broadcast, useless without the secret
     },
     addedAt: Date.now(),
+    votes: 0,
+    voters: [],
   };
+}
+
+// Votes are advisory — the host still decides what plays — but a group needs
+// a way to say "this one next" without everyone shouting in chat.
+function sortQueue(room) {
+  if (room.queueSort !== 'votes') return;
+  // Array#sort is stable, so equal counts keep the order they were added in
+  room.queue.sort((a, b) => (b.votes || 0) - (a.votes || 0));
+}
+function canManageItem(room, socket, item) {
+  if (!item || !item.addedBy) return false;
+  return roomHost(socket, room) || item.addedBy.ownerId === socket.user.ownerTag;
 }
 function memberOf(room, socket) {
   return room.members[socket.id] || null;
@@ -669,6 +685,7 @@ io.on('connection', (socket) => {
       seq: 0,
       passwordSalt: locked.passwordSalt,
       passwordHash: locked.passwordHash,
+      queueSort: 'added',
       updatedAt: Date.now(),
       updatedAtMono: monoNow(),
       createdAt: Date.now(),
@@ -885,6 +902,111 @@ io.on('connection', (socket) => {
     touch(room);
     io.to(joinedCode).emit('queue-update', room.queue);
     if (typeof cb === 'function') cb({ ok: true });
+  });
+
+  // Reorder: 'next' puts it at the front, 'up'/'down' nudge it. Only the
+  // person who queued it (or the host) may move it — same rule as deleting.
+  socket.on('queue-move', (args, cb) => {
+    const room = needRoom();
+    if (!room) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'no-room' });
+      return;
+    }
+    const member = memberOf(room, socket);
+    if (isListener(member)) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'not-allowed' });
+      return;
+    }
+    const id = args && args.id;
+    const where = args && args.to;
+    const i = room.queue.findIndex((t) => t.id === id);
+    if (i < 0) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'not-found' });
+      return;
+    }
+    if (!canManageItem(room, socket, room.queue[i])) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'not-allowed' });
+      return;
+    }
+    const at = where === 'next' ? 0
+      : where === 'up' ? Math.max(0, i - 1)
+      : where === 'down' ? Math.min(room.queue.length - 1, i + 1)
+      : -1;
+    if (at < 0 || at === i) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'bad-target' });
+      return;
+    }
+    const [item] = room.queue.splice(i, 1);
+    room.queue.splice(at, 0, item);
+    // A hand-reordered queue is asking to be left alone; a vote sort would
+    // undo it on the next vote.
+    if (room.queueSort !== 'added') {
+      room.queueSort = 'added';
+      io.to(joinedCode).emit('room-flags', {
+        djOnly: room.djOnly, hostId: room.hostId, queueSort: room.queueSort,
+      });
+    }
+    touch(room);
+    io.to(joinedCode).emit('queue-update', room.queue);
+    if (typeof cb === 'function') cb({ ok: true });
+  });
+
+  // One vote per member per track, toggled. Listeners can vote — it is not
+  // playback control, it is a opinion about what to play.
+  socket.on('queue-vote', (trackId, cb) => {
+    const room = needRoom();
+    if (!room) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'no-room' });
+      return;
+    }
+    if (!memberOf(room, socket)) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'no-room' });
+      return;
+    }
+    const now = Date.now();
+    if (now - (socket._lastVote || 0) < 400) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'slow-down' });
+      return;
+    }
+    socket._lastVote = now;
+    const item = room.queue.find((t) => t.id === trackId);
+    if (!item) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'not-found' });
+      return;
+    }
+    const tag = socket.user.ownerTag;
+    item.voters = Array.isArray(item.voters) ? item.voters : [];
+    const at = item.voters.indexOf(tag);
+    if (at >= 0) item.voters.splice(at, 1); else item.voters.push(tag);
+    item.votes = item.voters.length;
+    sortQueue(room);
+    touch(room);
+    io.to(joinedCode).emit('queue-update', room.queue);
+    if (typeof cb === 'function') cb({ ok: true, votes: item.votes });
+  });
+
+  socket.on('queue-sort', (mode, cb) => {
+    const room = needRoom();
+    if (!room) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'no-room' });
+      return;
+    }
+    if (!roomHost(socket, room)) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'host-only' });
+      return;
+    }
+    if (mode !== 'added' && mode !== 'votes') {
+      if (typeof cb === 'function') cb({ ok: false, error: 'bad-sort' });
+      return;
+    }
+    room.queueSort = mode;
+    sortQueue(room);
+    touch(room);
+    io.to(joinedCode).emit('room-flags', {
+      djOnly: room.djOnly, hostId: room.hostId, queueSort: room.queueSort,
+    });
+    io.to(joinedCode).emit('queue-update', room.queue);
+    if (typeof cb === 'function') cb({ ok: true, queueSort: room.queueSort });
   });
 
   function advance(room, code) {
@@ -1106,7 +1228,9 @@ io.on('connection', (socket) => {
     }
     room.djOnly = !!on;
     touch(room);
-    io.to(joinedCode).emit('room-flags', { djOnly: room.djOnly, hostId: room.hostId });
+    io.to(joinedCode).emit('room-flags', {
+      djOnly: room.djOnly, hostId: room.hostId, queueSort: room.queueSort || 'added',
+    });
     if (typeof cb === 'function') cb({ ok: true, djOnly: room.djOnly });
   });
 

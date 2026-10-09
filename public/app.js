@@ -15,7 +15,7 @@ const roomCode = $('roomCode'), copyBtn = $('copyBtn'), shareBtn = $('shareBtn')
 const roomPass = $('roomPass'), privateBadge = $('privateBadge');
 const userCount = $('userCount'), membersList = $('membersList');
 const djBadge = $('djBadge'), djRow = $('djRow'), djCheck = $('djCheck');
-const clearQueueBtn = $('clearQueueBtn');
+const clearQueueBtn = $('clearQueueBtn'), sortBtn = $('sortBtn');
 const inviteBox = $('inviteBox'), inviteLink = $('inviteLink'), qrImg = $('qrImg');
 const trackUrl = $('trackUrl'), loadBtn = $('loadBtn');
 const uploadBtn = $('uploadBtn'), trackFile = $('trackFile');
@@ -213,7 +213,20 @@ let pending = null;
 let scPlaying = false, scLastPos = 0, scActionAt = 0;
 const SC_ECHO_MS = 1500;
 let myRole = 'member', amHost = false, djOnly = false;
+let queueSort = 'added';
 let currentCode = null;
+function paintSortBtn() {
+  sortBtn.classList.toggle('hidden', !amHost);
+  sortBtn.textContent = queueSort === 'votes' ? 'مرتب: رأی' : 'مرتب: اضافه‌شده';
+}
+sortBtn.onclick = () => {
+  if (!socket) return;
+  socket.emit('queue-sort', queueSort === 'votes' ? 'added' : 'votes', (res) => {
+    if (!res || !res.ok) { setStatus('فقط هاست صف را مرتب می‌کنه'); return; }
+    queueSort = res.queueSort === 'votes' ? 'votes' : 'added';
+    paintSortBtn();
+  });
+};
 
 // local prefs (not synced)
 let muted = false;
@@ -411,6 +424,8 @@ function resetRoomUI() {
   djBadge.classList.add('hidden');
   privateBadge.classList.add('hidden');
   roomPass.value = '';
+  queueSort = 'added';
+  paintSortBtn();
   djRow.classList.add('hidden');
   clearQueueBtn.classList.add('hidden');
   djCheck.checked = false;
@@ -536,25 +551,53 @@ djCheck.addEventListener('change', () => {
 function paintQueue(q) {
   q = Array.isArray(q) ? q : [];
   queueCount.textContent = q.length;
-  queueList.innerHTML = q.map((t) => {
+  queueList.innerHTML = q.map((t, i) => {
     // Match on the server-issued hash, not guestId — guestId is ours to
     // declare, so the button would appear on other people's tracks too.
     const mine = !!(MY_OWNER_TAG && t.addedBy && t.addedBy.ownerId === MY_OWNER_TAG);
-    const canDel = amHost || mine;
+    const canManage = amHost || mine;
+    const voted = !!(MY_OWNER_TAG && Array.isArray(t.voters) && t.voters.indexOf(MY_OWNER_TAG) >= 0);
+    const votes = t.votes || 0;
+    const id = 'data-id="' + esc(t.id) + '"';
     return '<li class="q-item">' +
       '<span class="q-type">' + esc(t.type === 'youtube' ? 'YT' : t.type === 'soundcloud' ? 'SC' : 'MP3') + '</span>' +
       '<span class="q-title">' + esc(t.title || t.url) + '</span>' +
       '<span class="q-by">' + esc((t.addedBy && t.addedBy.username) || '') + '</span>' +
-      (canDel ? '<button class="chip-btn q-del" type="button" data-id="' + esc(t.id) + '">حذف</button>' : '') +
+      '<span class="q-tools">' +
+        (myRole === 'listener' ? '' :
+          '<button class="chip-btn q-vote' + (voted ? ' on' : '') + '" type="button" ' + id +
+          ' aria-pressed="' + (voted ? 'true' : 'false') + '" title="رأی">' +
+          (voted ? '♥' : '♡') + (votes ? ' ' + votes : '') + '</button>') +
+        (canManage
+          ? (i > 0 ? '<button class="chip-btn q-move narrow" type="button" ' + id + ' data-to="up" title="بالاتر">↑</button>' : '') +
+            '<button class="chip-btn q-move" type="button" ' + id + ' data-to="next" title="بعدی پخش شود">⏭ بعدی</button>' +
+            '<button class="chip-btn q-del" type="button" ' + id + '>حذف</button>'
+          : '') +
+      '</span>' +
       '</li>';
   }).join('') || '<li class="q-empty">صف خالیه</li>';
 }
 queueList.addEventListener('click', (e) => {
-  const b = e.target.closest('.q-del');
+  const b = e.target.closest('button[data-id]');
   if (!b || !socket) return;
-  socket.emit('queue-remove', b.getAttribute('data-id'), (res) => {
-    if (res && !res.ok) setStatus('اجازه نداری');
-  });
+  const id = b.getAttribute('data-id');
+  if (b.classList.contains('q-vote')) {
+    socket.emit('queue-vote', id, (res) => {
+      if (res && !res.ok) setStatus(res.error === 'slow-down' ? 'یک‌خرده صبر کن' : 'رأی ثبت نشد');
+    });
+    return;
+  }
+  if (b.classList.contains('q-move')) {
+    socket.emit('queue-move', { id: id, to: b.getAttribute('data-to') }, (res) => {
+      if (res && !res.ok) setStatus('اجازه نداری');
+    });
+    return;
+  }
+  if (b.classList.contains('q-del')) {
+    socket.emit('queue-remove', id, (res) => {
+      if (res && !res.ok) setStatus('اجازه نداری');
+    });
+  }
 });
 function paintHistory(h) {
   h = Array.isArray(h) ? h : [];
@@ -597,6 +640,7 @@ function paintMembers(members, dj) {
   uploadBtn.disabled = !canControlNow;
   djRow.classList.toggle('hidden', !amHost);
   clearQueueBtn.classList.toggle('hidden', !amHost);
+  paintSortBtn();
   if (amHost) djCheck.checked = djOnly;
 }
 membersList.addEventListener('click', (e) => {
@@ -1075,6 +1119,7 @@ function bindSocket(s) {
   s.on('room-flags', (f) => {
     if (!f) return;
     djOnly = !!f.djOnly;
+    if (f.queueSort) queueSort = f.queueSort === 'votes' ? 'votes' : 'added';
     // hostship itself comes from members (isHost flag) — never guess it
     paintMembers(lastMembers, djOnly);
   });
@@ -1099,6 +1144,7 @@ let lastMembers = [];
 
 function applyFullState(st) {
   lastMembers = st.members || [];
+  queueSort = st.queueSort === 'votes' ? 'votes' : 'added';
   paintMembers(st.members, st.djOnly);
   applyRoomSpeed(st.speed || 1);
   paintQueue(st.queue);

@@ -23,8 +23,10 @@ const SyncEcho = require('../public/echo.js');
 const ROOT = path.join(__dirname, '..');
 // Unique per run: a server left behind by an earlier run (Windows is slow to
 // release these) would otherwise make this one fail to bind and look like a
-// product bug.
-const PORT = 3099 + (process.pid % 400);
+// product bug. The range is deliberately far away from well-known ports —
+// 3099..3498 overlaps RDP's 3389, which is exactly the kind of collision
+// that reads as a flaky test.
+const PORT = 41000 + (process.pid % 400);
 const BASE = 'http://localhost:' + PORT;
 // second server, used to exercise the TRUST_PROXY=1 rate-limit key and the
 // room cap
@@ -33,12 +35,16 @@ const BASE2 = 'http://localhost:' + PORT2;
 const fail = (m) => { console.error('FAIL:', m); shutdown(1); };
 const ok = (m) => console.log('ok:', m);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Named so a timeout says *which* connection stalled — these run against
+// three different servers and "event timeout: connect" alone is a guessing
+// game. `s.io.uri` is where the client is pointed.
+const where = (s) => (s && s.io && s.io.uri) || 'client';
 const once = (s, ev) => new Promise((res, rej) => {
-  const t = setTimeout(() => rej(new Error('event timeout: ' + ev)), 10000);
+  const t = setTimeout(() => rej(new Error('event timeout: ' + ev + ' on ' + where(s))), 10000);
   s.once(ev, (v) => { clearTimeout(t); res(v); });
 });
 const emitAck = (s, ev, ...args) => new Promise((res, rej) => {
-  const t = setTimeout(() => rej(new Error('ack timeout: ' + ev)), 10000);
+  const t = setTimeout(() => rej(new Error('ack timeout: ' + ev + ' on ' + where(s))), 10000);
   s.emit(ev, ...args, (r) => { clearTimeout(t); res(r); });
 });
 
@@ -527,6 +533,75 @@ async function waitRunning(srv, label) {
   Priv.emit('leave-room'); NoPw.emit('leave-room'); Open.emit('leave-room');
   await sleep(300);
   ok('private rooms: password required, hash never broadcast, host token still wins');
+
+  // ---- queue control: move, vote, sort ----
+  const QC = client({ guestId: 'guestQc0018', displayName: 'Qandis' });
+  await once(QC, 'connect');
+  const qcc = await emitAck(QC, 'create-room', {});
+  if (!qcc || !qcc.ok) fail('queue-control create: ' + JSON.stringify(qcc));
+  const qcode = qcc.code;
+
+  const QM = client({ guestId: 'guestQm0019', displayName: 'Mahan' });
+  await once(QM, 'connect');
+  const qmj = await emitAck(QM, 'join-room', qcode, {});
+  if (!qmj || !qmj.ok || qmj.isHost) fail('queue-control member join: ' + JSON.stringify(qmj));
+
+  // the first add becomes the current track, so the queue holds C then M
+  await emitAck(QC, 'queue-add', { type: 'audio', url: 'https://x.test/qa.mp3', title: 'A' });
+  await emitAck(QC, 'queue-add', { type: 'audio', url: 'https://x.test/qc.mp3', title: 'C' });
+  const mAdd = await emitAck(QM, 'queue-add', { type: 'audio', url: 'https://x.test/qm.mp3', title: 'M' });
+  if (!mAdd || !mAdd.ok) fail('queue-control member add: ' + JSON.stringify(mAdd));
+  const ids = {};
+  (await emitAck(QM, 'sync-request')).queue.forEach((t) => { ids[t.title] = t.id; });
+  if (!ids.M || !ids.C) fail('expected C and M in the queue: ' + JSON.stringify(Object.keys(ids)));
+
+  // a member may move their own track to the front...
+  const moved = await emitAck(QM, 'queue-move', { id: ids.M, to: 'next' });
+  const afterMove = (await emitAck(QM, 'sync-request')).queue.map((t) => t.title);
+  if (!moved || !moved.ok || afterMove[0] !== 'M') fail('own track should move to the front: ' + JSON.stringify(afterMove));
+  // ...but not someone else's
+  const notMine = await emitAck(QM, 'queue-move', { id: ids.C, to: 'next' });
+  if (!notMine || notMine.ok !== false || notMine.error !== 'not-allowed') {
+    fail("a member should not be able to move another's track: " + JSON.stringify(notMine));
+  }
+  // the host can move anything
+  const hostMove = await emitAck(QC, 'queue-move', { id: ids.C, to: 'next' });
+  if (!hostMove || !hostMove.ok) fail('host should be able to move any track: ' + JSON.stringify(hostMove));
+  ok('queue reorder: own tracks and the host\'s, nobody else\'s');
+
+  // votes toggle and count
+  const v1 = await emitAck(QM, 'queue-vote', ids.C);
+  if (!v1 || !v1.ok || v1.votes !== 1) fail('first vote should count: ' + JSON.stringify(v1));
+  const v2 = await emitAck(QC, 'queue-vote', ids.C);
+  if (!v2 || !v2.ok || v2.votes !== 2) fail('a second vote should count: ' + JSON.stringify(v2));
+  await sleep(450); // votes are flood-limited to one per 400ms per socket
+  const v3 = await emitAck(QM, 'queue-vote', ids.C);
+  if (!v3 || !v3.ok || v3.votes !== 1) fail('voting again should undo it: ' + JSON.stringify(v3));
+
+  // sorting is the host's call, and it reorders the live queue
+  const notHostSort = await emitAck(QM, 'queue-sort', 'votes');
+  if (!notHostSort || notHostSort.ok !== false || notHostSort.error !== 'host-only') {
+    fail('a member should not be able to sort: ' + JSON.stringify(notHostSort));
+  }
+  const sorted = await emitAck(QC, 'queue-sort', 'votes');
+  if (!sorted || !sorted.ok) fail('host sort failed: ' + JSON.stringify(sorted));
+  const afterSort = (await emitAck(QM, 'sync-request')).queue;
+  if (afterSort[0].title !== 'C' || (afterSort[0].votes || 0) !== 1) {
+    fail('vote sort should put the voted track first: ' + JSON.stringify(afterSort.map((t) => [t.title, t.votes])));
+  }
+  const back = await emitAck(QC, 'queue-sort', 'added');
+  if (!back || !back.ok) fail('host sort back to added failed');
+
+  // a hand reorder takes the queue out of vote-sorting
+  await emitAck(QC, 'queue-sort', 'votes');
+  await emitAck(QM, 'queue-move', { id: ids.M, to: 'next' });
+  const stSort = await emitAck(QM, 'sync-request');
+  if (stSort.queueSort !== 'added') fail('a manual move should stop vote-sorting: ' + stSort.queueSort);
+
+  // votes survive a restart the same way the queue does
+  QC.emit('leave-room'); QM.emit('leave-room');
+  await sleep(300);
+  ok('queue votes and host-controlled sort');
 
   // ---- uploading a file instead of pasting a link ----
   const audioBytes = Buffer.concat([Buffer.from('ID3'), Buffer.alloc(512, 3)]);
