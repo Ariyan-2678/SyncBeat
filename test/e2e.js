@@ -8,6 +8,18 @@ const { spawn } = require('child_process');
 const { io } = require('socket.io-client');
 const SyncEcho = require('../public/echo.js');
 
+// The suite reads the SQLite file directly to prove what reached disk. Node
+// prints an ExperimentalWarning for node:sqlite on that require; keep the
+// test output readable without hiding anything else.
+(function silenceSqliteWarning() {
+  const forwarded = process.listeners('warning').slice();
+  process.removeAllListeners('warning');
+  process.on('warning', (w) => {
+    if (w && w.name === 'ExperimentalWarning' && /SQLite/i.test(w.message)) return;
+    forwarded.forEach((fn) => { try { fn(w); } catch (e) { /* listener threw */ } });
+  });
+})();
+
 const ROOT = path.join(__dirname, '..');
 // Unique per run: a server left behind by an earlier run (Windows is slow to
 // release these) would otherwise make this one fail to bind and look like a
@@ -33,12 +45,24 @@ const emitAck = (s, ev, ...args) => new Promise((res, rej) => {
 let server = null;
 let dataDir = null;
 let dataDir2 = null;
+const extraDataDirs = [];
 const openSockets = [];
 const extraServers = [];
-function client(auth, opts) {
-  const s = io(BASE, { auth, reconnection: false, ...(opts || {}) });
+function client(auth, opts, base) {
+  const s = io(base || BASE, { auth, reconnection: false, ...(opts || {}) });
   openSockets.push(s);
   return s;
+}
+// Read a room back out of the SQLite file. Used to prove that what we
+// *think* we saved is actually on disk, which a socket-level check cannot.
+function readRoomFrom(dbFile, code) {
+  if (!fs.existsSync(dbFile)) return null;
+  const { DatabaseSync } = require('node:sqlite');
+  const db = new DatabaseSync(dbFile, { readOnly: true });
+  try {
+    const row = db.prepare('SELECT * FROM rooms WHERE code = ?').get(code);
+    return row ? { chat: String(row.chat || ''), queue: String(row.queue || '') } : null;
+  } finally { db.close(); }
 }
 function shutdown(code) {
   openSockets.forEach((s) => { try { s.close(); } catch (e) {} });
@@ -46,6 +70,7 @@ function shutdown(code) {
   extraServers.forEach((s) => { try { s.kill(); } catch (e) {} });
   if (dataDir) { try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch (e) {} }
   if (dataDir2) { try { fs.rmSync(dataDir2, { recursive: true, force: true }); } catch (e) {} }
+  extraDataDirs.forEach((d) => { try { fs.rmSync(d, { recursive: true, force: true }); } catch (e) {} });
   process.exit(code);
 }
 
@@ -597,7 +622,7 @@ async function waitRunning(srv, label) {
   // to drop the last write on the floor. SIGTERM now flushes synchronously
   // before anything is torn down.
   await sleep(1600); // let any save queued by earlier tests land first
-  const roomsFile = path.join(dataDir, 'rooms.json');
+  const dbFile = path.join(dataDir, 'syncbeat.db');
   const flagFile = path.join(dataDir, 'raise.sig');
   // Swap in a server we can ask to shut down deterministically. POSIX gets
   // the real signal; Windows cannot deliver one to a child process at all,
@@ -620,8 +645,7 @@ async function waitRunning(srv, label) {
   if (!flushChat || !flushChat.ok) fail('flush setup chat: ' + JSON.stringify(flushChat));
   S.close();
   await sleep(200); // still well inside the 1.5s debounce window
-  const before = fs.existsSync(roomsFile) ? fs.readFileSync(roomsFile, 'utf8') : '';
-  if (before.indexOf(sc.code) !== -1) fail('test precondition: room already flushed before shutdown');
+  if (readRoomFrom(dbFile, sc.code)) fail('test precondition: room already flushed before shutdown');
 
   // Watch for exit BEFORE triggering, and bound the wait: a server that
   // never handles the signal would otherwise hang the suite forever
@@ -637,11 +661,47 @@ async function waitRunning(srv, label) {
     fail('server did not exit on shutdown — the flush handlers are missing');
   }
 
-  const after = fs.existsSync(roomsFile) ? fs.readFileSync(roomsFile, 'utf8') : '';
-  const restored = after ? JSON.parse(after) : {};
-  if (!restored[sc.code]) fail('shutdown did not flush the pending room');
-  if (after.indexOf('flush-me-please') === -1) fail('shutdown did not flush the pending chat');
+  const after = readRoomFrom(dbFile, sc.code);
+  if (!after) fail('shutdown did not flush the pending room');
+  else if (after.chat.indexOf('flush-me-please') === -1) fail('shutdown did not flush the pending chat: ' + after.chat);
   ok('shutdown flushes pending room state to disk');
+
+  // ---- a rooms.json left over from before SQLite is imported on first boot ----
+  const legacyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-legacy-'));
+  extraDataDirs.push(legacyDir);
+  fs.writeFileSync(path.join(legacyDir, 'rooms.json'), JSON.stringify({
+    LEGACY: {
+      hostId: 'u-legacy', hostToken: 'legacy-token-value-0123456789abcd', banned: ['badguest1'],
+      djOnly: false, track: null, queue: [], history: [],
+      chat: [{ id: 'm1', username: 'Old', text: 'hello-legacy', at: Date.now() }],
+      isPlaying: false, position: 0, speed: 1,
+      createdAt: Date.now(), updatedAt: Date.now(), lastActive: Date.now(),
+    },
+  }));
+  const legacyPort = PORT + 2;
+  const legacySrv = startServer({ PORT: String(legacyPort), SB_DATA_DIR: legacyDir }, 'test/raise-sig.js');
+  extraServers.push(legacySrv);
+  await waitRunning(legacySrv, 'legacy-import server');
+  await sleep(300);
+  const L = client({ guestId: 'guestL0014', displayName: 'Leila' }, {}, 'http://localhost:' + legacyPort);
+  await once(L, 'connect');
+  const jl = await emitAck(L, 'join-room', 'LEGACY', {});
+  if (!jl || !jl.ok) fail('a room from rooms.json should still exist: ' + JSON.stringify(jl));
+  else {
+    const chat = (jl.state.chat || []).map((m) => m.text).join(' ');
+    if (chat.indexOf('hello-legacy') === -1) fail('legacy chat did not survive the import: ' + chat);
+    if ((jl.state.members || []).length !== 1) fail('legacy room should be empty on restore');
+  }
+  const Banned = client({ guestId: 'badguest1', displayName: 'Baddy' }, {}, 'http://localhost:' + legacyPort);
+  await once(Banned, 'connect');
+  const bj = await emitAck(Banned, 'join-room', 'LEGACY', {});
+  if (!bj || bj.ok !== false || bj.error !== 'banned') {
+    fail('the imported ban list did not survive: ' + JSON.stringify(bj));
+  }
+  L.emit('leave-room');
+  await sleep(200);
+  ok('a rooms.json from the previous version is imported on boot');
+  legacySrv.kill();
 
   // ---- echo policy: is this media event the user's, or the player's? ----
   // Pure logic from public/echo.js — no server needed, but it decides whether

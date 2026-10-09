@@ -137,57 +137,38 @@ function adoptOwnerSecret(v) {
 
 // ---------------------------------------------------------- persistence
 const DATA_DIR = process.env.SB_DATA_DIR || path.join(__dirname, 'data');
-const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
-try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) { /* exists */ }
+const store = require('./lib/store').open(DATA_DIR);
 
-function loadJson(file, fallback) {
-  try {
-    if (!fs.existsSync(file)) return fallback;
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch (e) {
-    console.error('loadJson failed for', file, e.message);
-    return fallback;
-  }
-}
+// Rooms are written one at a time and only when they change. Every keystroke
+// used to serialize and rewrite *every* room on the server into rooms.json.
+const dirty = new Set();
 let saveTimer = null;
-function scheduleSave() {
+function markDirty(code) {
+  if (!code) return;
+  dirty.add(code);
   if (saveTimer) return;
-  saveTimer = setTimeout(() => {
-    saveTimer = null;
-    persistNow();
-  }, 1500);
+  saveTimer = setTimeout(flushDirty, 1500);
   // Never the reason the process stays alive — the listening server is, and
   // shutdown() flushes anything still pending on the way out.
   saveTimer.unref && saveTimer.unref();
 }
-function persistNow() {
-  try {
-    const portable = {};
-    for (const [code, r] of Object.entries(rooms)) {
-      portable[code] = {
-        hostId: r.hostId,
-        hostToken: r.hostToken || null,
-        banned: (r.banned || []).slice(0, 200),
-        djOnly: !!r.djOnly,
-        track: r.track,
-        queue: (r.queue || []).slice(0, 100),
-        history: (r.history || []).slice(-30),
-        chat: (r.chat || []).slice(-100),
-        isPlaying: !!r.isPlaying,
-        position: r.position || 0,
-        speed: VALID_SPEEDS.includes(r.speed) ? r.speed : 1,
-        updatedAt: r.updatedAt || Date.now(),
-        createdAt: r.createdAt || Date.now(),
-        lastActive: r.lastActive || Date.now(),
-      };
+function flushDirty() {
+  saveTimer = null;
+  const codes = Array.from(dirty);
+  dirty.clear();
+  for (const code of codes) {
+    try {
+      const r = rooms[code];
+      if (r) store.putRoom(code, r); else store.deleteRoom(code);
+    } catch (e) {
+      console.error('persist failed for ' + code + ':', e.message);
     }
-    // Atomic write: a crash mid-write must not truncate rooms.json.
-    const tmp = ROOMS_FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(portable, null, 1));
-    fs.renameSync(tmp, ROOMS_FILE);
-  } catch (e) {
-    console.error('persist failed:', e.message);
   }
+}
+// Synchronous, so it is safe on the way out of the process.
+function persistNow() {
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  flushDirty();
 }
 
 // ---------------------------------------------------------- guest identity
@@ -239,14 +220,6 @@ const UPLOAD_TTL_MS = 24 * 3600 * 1000;
 // An upload is addressed as /uploads/<32 hex>.<ext>. Nothing else is ever
 // accepted, so the path cannot be walked out of the uploads directory.
 const UPLOAD_PATH_RE = /^\/uploads\/[a-f0-9]{32}\.[a-z0-9]{2,5}$/;
-let uploadBytesUsed = 0;
-(function measureUploads() {
-  try {
-    for (const f of fs.readdirSync(UPLOAD_DIR)) {
-      try { uploadBytesUsed += fs.statSync(path.join(UPLOAD_DIR, f)).size; } catch (e) { /* raced */ }
-    }
-  } catch (e) { /* no dir yet */ }
-})();
 
 function uploadExtOf(nameHeader, contentType) {
   const type = String(contentType || '').toLowerCase().split(';')[0].trim();
@@ -285,18 +258,19 @@ app.post('/api/upload',
     if (!Buffer.isBuffer(buf) || !buf.length) return res.status(400).json({ ok: false, error: 'empty' });
     const ext = uploadExtOf(req.headers['x-filename'], req.headers['content-type']);
     if (!ext) return res.status(415).json({ ok: false, error: 'bad-type' });
-    if (uploadBytesUsed + buf.length > MAX_UPLOAD_TOTAL) {
+    if (store.uploadBytes() + buf.length > MAX_UPLOAD_TOTAL) {
       return res.status(507).json({ ok: false, error: 'storage-full' });
     }
     const id = crypto.randomBytes(16).toString('hex');
-    try { fs.writeFileSync(path.join(UPLOAD_DIR, id + '.' + ext), buf); } catch (e) {
+    const stored = id + '.' + ext;
+    try { fs.writeFileSync(path.join(UPLOAD_DIR, stored), buf); } catch (e) {
       console.error('upload failed:', e.message);
       return res.status(500).json({ ok: false, error: 'write-failed' });
     }
-    uploadBytesUsed += buf.length;
+    store.addUpload(stored, buf.length);
     let name = '';
     try { name = decodeURIComponent(String(req.headers['x-filename'] || '')); } catch (e) { name = ''; }
-    res.json({ ok: true, path: '/uploads/' + id + '.' + ext, title: cleanTitle(name.replace(/\.[^.]+$/, ''), 'آپلود') });
+    res.json({ ok: true, path: '/uploads/' + stored, title: cleanTitle(name.replace(/\.[^.]+$/, ''), 'آپلود') });
   });
 
 // Files nobody points at any more — their room expired, or the track was
@@ -311,22 +285,19 @@ function referencedUploads() {
   return used;
 }
 function sweepUploads() {
-  let files;
-  try { files = fs.readdirSync(UPLOAD_DIR); } catch (e) { return 0; }
-  if (!files.length) return 0;
   const used = referencedUploads();
   const cutoff = Date.now() - UPLOAD_TTL_MS;
   let dropped = 0;
-  for (const f of files) {
-    if (used.has(f)) continue;
-    const full = path.join(UPLOAD_DIR, f);
+  for (const { name, bytes } of store.uploads()) {
+    if (used.has(name)) continue;
     try {
-      const st = fs.statSync(full);
+      const st = fs.statSync(path.join(UPLOAD_DIR, name));
+      // age from the file, so a room that keeps referencing it wins over age
       if (!st.isFile() || st.mtimeMs > cutoff) continue;
-      fs.unlinkSync(full);
-      uploadBytesUsed = Math.max(0, uploadBytesUsed - st.size);
-      dropped++;
-    } catch (e) { /* raced with another pass */ }
+      fs.unlinkSync(path.join(UPLOAD_DIR, name));
+    } catch (e) { continue; /* already gone */ }
+    store.removeUpload(name);
+    dropped += bytes;
   }
   return dropped;
 }
@@ -345,10 +316,11 @@ setInterval(() => {
 // }
 const rooms = {};
 (function restoreRooms() {
-  const saved = loadJson(ROOMS_FILE, {});
+  const saved = store.allRooms();
   for (const [code, s] of Object.entries(saved)) {
     if (!code || !s) continue;
     rooms[code] = {
+      code,
       hostId: s.hostId || null,
       hostToken: typeof s.hostToken === 'string' ? s.hostToken : null,
       banned: Array.isArray(s.banned) ? s.banned.slice(0, 200) : [],
@@ -437,7 +409,7 @@ function tickState(room) {
 }
 function touch(room) {
   room.lastActive = Date.now();
-  scheduleSave();
+  markDirty(room.code);
 }
 
 const VALID_TRACK_TYPES = ['audio', 'youtube', 'soundcloud'];
@@ -594,10 +566,11 @@ setInterval(() => {
   for (const [code, r] of Object.entries(rooms)) {
     if (liveMemberCount(r) === 0 && (r.lastActive || 0) < cutoff) {
       delete rooms[code];
+      markDirty(code); // flushDirty turns a missing room into a DELETE
       dropped++;
     }
   }
-  if (dropped) { console.log('swept rooms:', dropped); scheduleSave(); }
+  if (dropped) { console.log('swept rooms:', dropped); }
 }, 10 * 60 * 1000).unref();
 
 // ---------------------------------------------------------- socket identity (guest)
@@ -644,6 +617,7 @@ io.on('connection', (socket) => {
     // Secret host capability — returned ONLY to the creator here.
     const hostToken = crypto.randomBytes(24).toString('base64url');
     rooms[code] = {
+      code,
       hostId: null,
       hostToken,
       banned: [],
