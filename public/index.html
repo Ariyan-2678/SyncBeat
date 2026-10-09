@@ -142,6 +142,13 @@
           <input id="djCheck" type="checkbox" />
           فقط هاست (DJ) پخش را کنترل کند
         </label>
+        <div id="pwRow" class="pw-row hidden">
+          <input id="pwInput" type="password" maxlength="64" dir="ltr"
+                 placeholder="رمز اتاق — خالی یعنی بدون رمز" autocomplete="new-password"
+                 aria-label="رمز اتاق" />
+          <button id="pwSave" class="chip-btn" type="button">ثبت رمز</button>
+        </div>
+        <p id="pwHint" class="join-hint hidden">گذاشتنِ رمز در را روی آدم‌هایی که الان توی اتاقن نمی‌بنده؛ فقط ورودِ بعدی رو سخت می‌کنه.</p>
       </div>
 
       <form id="trackForm" class="track-input" autocomplete="off">
