@@ -208,6 +208,16 @@ process.on('SIGINT', () => { cleanup(); process.exit(130); });
   await sleep(600);
   const roomCode = await evalIn(A, "document.getElementById('roomCode').textContent");
   check('room was created', /^[A-Z0-9]{5}$/.test(roomCode), roomCode);
+  // The creator must be the host — everything host-shaped in the UI hangs
+  // off this, so assert it the moment it should be true.
+  const creatorIsHost = await evalIn(A, `(() => ({
+    badge: !!document.querySelector('#membersList .m-badge'),
+    kick: document.querySelectorAll('#membersList .m-kick').length,
+    sort: !document.getElementById('sortBtn').classList.contains('hidden'),
+  }))()`);
+  // alone in the room, so no kick buttons — but the host-only sort toggle is up
+  check('the creator is the host', creatorIsHost.badge === true && creatorIsHost.sort === true,
+    JSON.stringify(creatorIsHost));
 
   console.log('--- add a real track and see it actually play ---');
   await evalIn(A, "document.getElementById('trackUrl').value = " + JSON.stringify(audioUrl));
@@ -357,6 +367,62 @@ process.on('SIGINT', () => { cleanup(); process.exit(130); });
   await sleep(900);
   const voteCount = await evalIn(B, "(() => { const b = document.querySelector('#queueList .q-vote'); return b ? b.textContent : 'none'; })()");
   check('a vote reaches the other tab', /1/.test(voteCount), voteCount + ' (A said ' + voteOk + ')');
+
+  console.log('--- the host can lock and unlock a room after the fact ---');
+  // A and B are both in roomCode, and A is the host. Set a password from
+  // inside the room — not at creation, which is the part that used to be
+  // the only way in.
+  const lockUi = await evalIn(A, `(() => ({
+    row: !document.getElementById('pwRow').classList.contains('hidden'),
+    btn: document.getElementById('pwSave').textContent,
+  }))()`);
+  check('the host sees the password control', lockUi.row === true,
+    JSON.stringify(lockUi) + ' state=' + JSON.stringify(await evalIn(A, `(() => ({
+      hasHostBadge: !!document.querySelector('#membersList .m-badge'),
+      kickButtons: document.querySelectorAll('#membersList .m-kick').length,
+      sortVisible: !document.getElementById('sortBtn').classList.contains('hidden'),
+      members: document.getElementById('membersList').textContent.trim().slice(0, 60),
+    }))()`)));
+
+  const nonHostSeesIt = await evalIn(B, "!document.getElementById('pwRow').classList.contains('hidden')");
+  check('a non-host does not', nonHostSeesIt === false);
+
+  await evalIn(A, "document.getElementById('pwInput').value = 'newpass'");
+  await evalIn(A, "document.getElementById('pwSave').click()");
+  await sleep(1200);
+  const lockedState = await evalIn(A, `(() => ({
+    lock: !document.getElementById('privateBadge').classList.contains('hidden'),
+    btn: document.getElementById('pwSave').textContent,
+    status: document.getElementById('status').textContent,
+  }))()`);
+  check('locking shows the lock', lockedState.lock === true, JSON.stringify(lockedState));
+  check('and the control relabels itself', /تغییر رمز/.test(lockedState.btn), lockedState.btn);
+  const bLock = await evalIn(B, "!document.getElementById('privateBadge').classList.contains('hidden')");
+  check('the other tab is told too', bLock === true);
+
+  // B leaves; without the password it cannot come back in
+  await evalIn(B, "document.getElementById('leaveBtn').click()");
+  await sleep(500);
+  await evalIn(B, "delete localStorage['sb-roompw']; delete localStorage['sb-hosts']");
+  await evalIn(B, "document.getElementById('codeInput').value = " + JSON.stringify(roomCode));
+  await evalIn(B, "document.getElementById('joinBtn').click()");
+  await sleep(1400);
+  const lockedOut2 = await evalIn(B, `(() => ({
+    err: document.getElementById('lobbyError').textContent,
+    inRoom: !document.getElementById('room').classList.contains('hidden'),
+  }))()`);
+  check('without the new password it stays out', /رمز/.test(lockedOut2.err) && lockedOut2.inRoom === false, JSON.stringify(lockedOut2));
+
+  // A clears it, B gets back in
+  await evalIn(A, "document.getElementById('pwInput').value = ''");
+  await evalIn(A, "document.getElementById('pwSave').click()");
+  await sleep(1200);
+  const unlockedState = await evalIn(A, "document.getElementById('privateBadge').classList.contains('hidden')");
+  check('clearing removes the lock', unlockedState === true);
+  await evalIn(B, "document.getElementById('joinBtn').click()");
+  await sleep(1200);
+  const backIn = await evalIn(B, "!document.getElementById('room').classList.contains('hidden')");
+  check('and the room opens again', backIn === true);
 
   const realErrors = consoleErrors.filter((e) => !/net::|favicon|qrserver|fonts\.g|youtube\.com|soundcloud|noembed/i.test(e));
   console.log('--- console ---');

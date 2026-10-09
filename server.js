@@ -79,8 +79,7 @@ function rateKeyOf(handshake) {
   }
   return handshake && handshake.address;
 }
-const rateHits = new Map();
-function rateOk(key, limit, windowMs) {
+const rateHits = new Map();function rateOk(key, limit, windowMs) {
   const now = Date.now();
   let e = rateHits.get(key);
   if (!e || now - e.start > windowMs) { e = { start: now, count: 0 }; rateHits.set(key, e); }
@@ -91,6 +90,11 @@ setInterval(() => {
   const now = Date.now();
   for (const [k, e] of rateHits) if (now - e.start > 120000) rateHits.delete(k);
 }, 60000).unref();
+
+// 30 create/join attempts per minute is the shipped default. Overridable so
+// the test suite can let the scenarios run without tripping over the very
+// limiter one of them exists to prove.
+const ROOM_RATE_LIMIT = parseInt(process.env.ROOM_RATE_LIMIT || '30', 10);
 
 // The host may vanish for a moment (refresh/reconnect); hold the transfer
 // this long so an honest rejoin with the token keeps the host title.
@@ -481,6 +485,20 @@ function canControl(room, member) {
   return true;
 }
 
+// The token proves you are the creator — but two live connections can hold it
+// at the same time, and the common case is two tabs of one browser, which
+// share localStorage. Letting the second tab take the crown silently strips
+// the first of every host control, so a live incumbent is never demoted by a
+// claim. If the incumbent goes away, the grace period and the very same
+// token still sort it out.
+function claimHost(room, member) {
+  const incumbent = Object.values(room.members).find((m) => m.isHost);
+  if (incumbent && incumbent !== member) return false;
+  setHost(room, member);
+  if (room._hostTimer) { clearTimeout(room._hostTimer); room._hostTimer = null; }
+  return true;
+}
+
 // The SoundCloud widget exposes no playback-rate control, so a room speed
 // other than 1x would run the server clock ahead of the audio and leave
 // every SC track drifting forever (the heartbeat would then re-seek it every
@@ -596,7 +614,7 @@ io.on('connection', (socket) => {
 
   socket.on('create-room', (opts, cb) => {
     if (typeof opts === 'function') { cb = opts; opts = {}; }
-    if (!rateOk('room:' + socket.rateKey, 30, 60000)) {
+    if (!rateOk('room:' + socket.rateKey, ROOM_RATE_LIMIT, 60000)) {
       if (typeof cb === 'function') cb({ ok: false, error: 'rate-limited' });
       return;
     }
@@ -670,7 +688,7 @@ io.on('connection', (socket) => {
   socket.on('join-room', (code, opts, cb) => {
     if (typeof opts === 'function') { cb = opts; opts = {}; }
     code = (code || '').toUpperCase().trim();
-    if (!rateOk('room:' + socket.rateKey, 30, 60000)) {
+    if (!rateOk('room:' + socket.rateKey, ROOM_RATE_LIMIT, 60000)) {
       if (typeof cb === 'function') cb({ ok: false, error: 'rate-limited' });
       return;
     }
@@ -717,16 +735,13 @@ io.on('connection', (socket) => {
       // crown immediately — the oldest this can be granted is after the
       // grace window below expires, during which the token holder can
       // still reclaim it by presenting the token.
-      if (claimed) {
-        setHost(room, member);
-        if (room._hostTimer) { clearTimeout(room._hostTimer); room._hostTimer = null; }
-      }
+      if (claimed) claimHost(room, member);
     } else {
       member = existing;
       if (member.role !== (wantListener ? 'listener' : 'member')) {
         member.role = wantListener ? 'listener' : 'member';
       }
-      if (claimed) { setHost(room, member); if (room._hostTimer) { clearTimeout(room._hostTimer); room._hostTimer = null; } }
+      if (claimed) claimHost(room, member);
     }
     // Room is hostless (nobody holds the crown, token never claimed): arm
     // the grace clock so it is never stuck that way — see ensureHostTimer.
@@ -737,7 +752,9 @@ io.on('connection', (socket) => {
         ok: true,
         code,
         uid: socket.user.id,
-        hostToken: claimed ? room.hostToken : undefined,
+        // only hand the token back if the claim actually landed — otherwise
+        // the client would believe it is hosting while somebody else is
+        hostToken: claimed && member.isHost ? room.hostToken : undefined,
         ownerSecret: socket.ownerSecret,
         ownerTag: socket.user.ownerTag,
         isHost: !!member.isHost,
@@ -1172,9 +1189,35 @@ io.on('connection', (socket) => {
     room.djOnly = !!on;
     touch(room);
     io.to(joinedCode).emit('room-flags', {
-      djOnly: room.djOnly, hostId: room.hostId, queueSort: room.queueSort || 'added',
+      djOnly: room.djOnly, hostId: room.hostId,
+      queueSort: room.queueSort || 'added', private: !!room.passwordHash,
     });
     if (typeof cb === 'function') cb({ ok: true, djOnly: room.djOnly });
+  });
+
+  // Change or remove the password after the fact. Setting one locks the door
+  // behind whoever is already inside — they keep their seats — but nobody new
+  // gets in without it. Clearing it reopens the room.
+  socket.on('set-room-password', (args, cb) => {
+    const room = needRoom();
+    if (!room) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'no-room' });
+      return;
+    }
+    if (!roomHost(socket, room)) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'host-only' });
+      return;
+    }
+    const pw = cleanPassword(args && args.password);
+    const locked = pw ? makePassword(pw) : { passwordSalt: null, passwordHash: null };
+    room.passwordSalt = locked.passwordSalt;
+    room.passwordHash = locked.passwordHash;
+    touch(room);
+    io.to(joinedCode).emit('room-flags', {
+      djOnly: room.djOnly, hostId: room.hostId,
+      queueSort: room.queueSort || 'added', private: !!room.passwordHash,
+    });
+    if (typeof cb === 'function') cb({ ok: true, private: !!room.passwordHash });
   });
 
   // Explicit leave from the lobby UI (staying connected).

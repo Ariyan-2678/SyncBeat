@@ -117,6 +117,9 @@ function startServer(env, script) {
     env: {
       ...process.env, PORT: String(PORT), HOST_GRACE_MS: '900',
       SB_DATA_DIR: dataDir, TRUST_PROXY: '0',
+      // the real limiter is proved against its own server below; the main
+      // one is turned up so adding a scenario does not trip over it
+      ROOM_RATE_LIMIT: '500',
       // small on purpose so the oversize-upload check stays cheap
       MAX_UPLOAD_MB: '1', ...(env || {}),
     },
@@ -543,6 +546,99 @@ async function waitRunning(srv, label) {
   await sleep(300);
   ok('private rooms: password required, hash never broadcast, host token still wins');
 
+  // ---- the password can be set and cleared after the room exists ----
+  // everyone left at the end of the block above, so put the host and a
+  // non-host back in before changing the rules under them
+  const rejoinHost = await emitAck(Open, 'join-room', openCreate.code, { hostToken: openCreate.hostToken });
+  if (!rejoinHost || !rejoinHost.ok || !rejoinHost.isHost) fail('host rejoin: ' + JSON.stringify(rejoinHost));
+  const rejoinOpen = await emitAck(NoPw, 'join-room', openCreate.code, {});
+  if (!rejoinOpen || !rejoinOpen.ok) fail('rejoin before password change: ' + JSON.stringify(rejoinOpen));
+  const flagsSeen = [];
+  NoPw.on('room-flags', (f) => flagsSeen.push(f));
+  const notHostPw = await emitAck(NoPw, 'set-room-password', { password: 'mine' });
+  if (!notHostPw || notHostPw.ok !== false || notHostPw.error !== 'host-only') {
+    fail('a member should not be able to set the password: ' + JSON.stringify(notHostPw));
+  }
+  const locked = await emitAck(Open, 'set-room-password', { password: 'letmein' });
+  if (!locked || !locked.ok || locked.private !== true) {
+    fail('the host should be able to lock an open room: ' + JSON.stringify(locked));
+  }
+  // the ack comes back on the host's socket while the broadcast travels to
+  // another — no ordering between them
+  await sleep(500);
+  if (!flagsSeen.some((f) => f.private === true)) {
+    fail('room-flags should tell the room it is now private: ' + JSON.stringify(flagsSeen));
+  }
+
+  // nobody new gets in, and the hash still never travels
+  NoPw.emit('leave-room');
+  await sleep(400);
+  const lockedOut = await emitAck(NoPw, 'join-room', openCreate.code, {});
+  if (!lockedOut || lockedOut.ok !== false || lockedOut.error !== 'wrong-password') {
+    fail('a room locked after the fact should refuse entry: ' + JSON.stringify(lockedOut));
+  }
+  // whoever is already inside stays where they are — locking the door behind
+  // them, not throwing them out
+  const stillIn = await emitAck(Open, 'sync-request');
+  if (!(stillIn.members || []).length) fail('the host should still be in the room');
+
+  const unlocked = await emitAck(Open, 'set-room-password', { password: '' });
+  if (!unlocked || !unlocked.ok || unlocked.private !== false) {
+    fail('the host should be able to reopen a room: ' + JSON.stringify(unlocked));
+  }
+  const reopened = await emitAck(NoPw, 'join-room', openCreate.code, {});
+  if (!reopened || !reopened.ok) fail('an unlocked room should admit people again: ' + JSON.stringify(reopened));
+
+  // ...and setting one again takes effect immediately for the next join
+  await emitAck(Open, 'set-room-password', { password: 'letmein' });
+  NoPw.emit('leave-room');
+  await sleep(400);
+  const again2 = await emitAck(NoPw, 'join-room', openCreate.code, {});
+  if (!again2 || again2.ok !== false) fail('re-locking should take effect: ' + JSON.stringify(again2));
+  const withPw = await emitAck(NoPw, 'join-room', openCreate.code, { password: 'letmein' });
+  if (!withPw || !withPw.ok) fail('the new password should work: ' + JSON.stringify(withPw));
+
+  Priv.emit('leave-room'); Open.emit('leave-room'); NoPw.emit('leave-room');
+  await sleep(300);
+  ok('room password can be set, cleared and rotated by the host alone');
+
+  // ---- a second live claim on the host token must not dethrone the incumbent
+  // Two tabs of one browser share localStorage, so the second tab holds the
+  // first one's hostToken. Letting it take the crown stripped the host tab
+  // of every control it had.
+  const HC = client({ guestId: 'guestHc0020', displayName: 'Homa' });
+  await once(HC, 'connect');
+  const claimRes = await emitAck(HC, 'create-room', {});
+  if (!claimRes || !claimRes.ok || !claimRes.isHost) fail('host-claim setup: ' + JSON.stringify(claimRes));
+  const claimCode = claimRes.code;
+
+  const ClaimB = client({ guestId: 'guestHc0021', displayName: 'TabTwo' });
+  await once(ClaimB, 'connect');
+  const claimJoin = await emitAck(ClaimB, 'join-room', claimCode, { hostToken: claimRes.hostToken });
+  if (!claimJoin || !claimJoin.ok) fail('second tab join: ' + JSON.stringify(claimJoin));
+  if (claimJoin.isHost) fail('a second live claim on the host token took the crown');
+  if (claimJoin.hostToken) fail('a claim that did not land should not get the token back');
+
+  const claimState = await emitAck(HC, 'sync-request');
+  const claimHosts = (claimState.members || []).filter((m) => m.isHost);
+  if (claimHosts.length !== 1 || claimHosts[0].userId !== claimRes.uid) {
+    fail('exactly the original host should still hold the crown: ' + JSON.stringify(claimHosts));
+  }
+  // ...and the original holder still has the controls
+  const claimClear = await emitAck(HC, 'queue-clear');
+  if (!claimClear || !claimClear.ok) fail('the original host lost its controls: ' + JSON.stringify(claimClear));
+
+  // once the incumbent goes, the same token still wins the room back
+  HC.emit('leave-room');
+  await sleep(1400); // > HOST_GRACE_MS
+  const claimBack = await emitAck(ClaimB, 'join-room', claimCode, { hostToken: claimRes.hostToken });
+  if (!claimBack || !claimBack.ok || !claimBack.isHost) {
+    fail('the token should still claimBack hostship once nobody holds it: ' + JSON.stringify(claimBack));
+  }
+  ClaimB.emit('leave-room');
+  await sleep(300);
+  ok('a live incumbent host is never dethroned by a second claim');
+
   // ---- queue control: move, vote, sort ----
   const QC = client({ guestId: 'guestQc0018', displayName: 'Qandis' });
   await once(QC, 'connect');
@@ -698,6 +794,7 @@ async function waitRunning(srv, label) {
   await new Promise((r) => ytStub.listen(stubPort, r));
   const proxySrv = startServer({
     PORT: String(PORT2), TRUST_PROXY: '1', SB_DATA_DIR: dataDir2, MAX_ROOMS: '2',
+    ROOM_RATE_LIMIT: '30', // this server exists partly to prove the limiter
     YOUTUBE_API_KEY: 'stub-key', YOUTUBE_API_BASE: 'http://localhost:' + stubPort,
   });
   extraServers.push(proxySrv);
@@ -775,8 +872,17 @@ async function waitRunning(srv, label) {
   }
   ok('room cap enforced (MAX_ROOMS)');
 
-  // ---- rate limit (shares the per-IP window with everything above) ----
-  const R = client({ guestId: 'guestR0007', displayName: 'Rate' });
+  // ---- rate limit, on its own server so it cannot be starved by the rest ----
+  const rateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-test-rate-'));
+  extraDataDirs.push(rateDir);
+  const ratePort = PORT + 4;
+  const rateSrv = startServer({ PORT: String(ratePort), SB_DATA_DIR: rateDir, ROOM_RATE_LIMIT: '30' }, 'test/raise-sig.js');
+  extraServers.push(rateSrv);
+  await waitRunning(rateSrv, 'rate-limit server');
+  await sleep(300);
+  const rateBase = 'http://localhost:' + ratePort;
+
+  const R = client({ guestId: 'guestR0007', displayName: 'Rate' }, {}, rateBase);
   await once(R, 'connect');
   let gotLimited = false;
   for (let i = 0; i < 40 && !gotLimited; i++) {
@@ -792,7 +898,8 @@ async function waitRunning(srv, label) {
   // straight through — it has to be refused instead.
   const spoof = client(
     { guestId: 'guestS0009', displayName: 'Spoof' },
-    { extraHeaders: { 'x-forwarded-for': '203.0.113.9' } }
+    { extraHeaders: { 'x-forwarded-for': '203.0.113.9' } },
+    rateBase
   );
   await once(spoof, 'connect');
   const sp = await emitAck(spoof, 'join-room', 'ZZZZZ', {});
@@ -801,6 +908,7 @@ async function waitRunning(srv, label) {
   }
   spoof.close();
   ok('forged X-Forwarded-For ignored while TRUST_PROXY is off');
+  rateSrv.kill();
 
   // ---- shutdown flushes the debounced save ----
   // scheduleSave() waits 1.5s, so a host killing us inside that window used

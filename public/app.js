@@ -18,6 +18,7 @@ const searchBox = $('searchBox'), searchForm = $('searchForm'), searchInput = $(
 const userCount = $('userCount'), membersList = $('membersList');
 const djBadge = $('djBadge'), djRow = $('djRow'), djCheck = $('djCheck');
 const clearQueueBtn = $('clearQueueBtn'), sortBtn = $('sortBtn');
+const pwRow = $('pwRow'), pwInput = $('pwInput'), pwSave = $('pwSave'), pwHint = $('pwHint');
 const inviteBox = $('inviteBox'), inviteLink = $('inviteLink'), qrImg = $('qrImg');
 const trackUrl = $('trackUrl'), loadBtn = $('loadBtn');
 const uploadBtn = $('uploadBtn'), trackFile = $('trackFile');
@@ -217,7 +218,26 @@ let scPlaying = false, scLastPos = 0, scActionAt = 0;
 const SC_ECHO_MS = 1500;
 let myRole = 'member', amHost = false, djOnly = false;
 let queueSort = 'added';
+let isPrivate = false;
 let currentCode = null;
+function paintPrivate() {
+  privateBadge.classList.toggle('hidden', !isPrivate);
+  if (amHost) pwSave.textContent = isPrivate ? 'تغییر رمز' : 'گذاشتن رمز';
+}
+pwSave.onclick = () => {
+  if (!socket || !amHost) return;
+  const pw = pwInput.value;
+  socket.emit('set-room-password', { password: pw }, (res) => {
+    if (!res || !res.ok) { setStatus('فقط هاست رمز اتاق رو عوض می‌کنه'); return; }
+    isPrivate = !!res.private;
+    // the host is the one person who knows the new password, so keep it for
+    // the reconnect that would otherwise ask again
+    if (isPrivate) saveRoomPassword(currentCode, pw); else saveRoomPassword(currentCode, null);
+    pwInput.value = '';
+    paintPrivate();
+    setStatus(isPrivate ? 'رمز اتاق عوض شد ✓' : 'رمز اتاق برداشته شد ✓');
+  });
+};
 function paintSortBtn() {
   sortBtn.classList.toggle('hidden', !amHost);
   sortBtn.textContent = queueSort === 'votes' ? 'مرتب: رأی' : 'مرتب: اضافه‌شده';
@@ -458,7 +478,8 @@ function onEnteredRoom(res) {
   myRole = res.role || 'member';
   amHost = !!res.isHost;
   if (res.state && res.state.private) saveRoomPassword(res.code, roomPass.value || getRoomPassword(res.code));
-  privateBadge.classList.toggle('hidden', !(res.state && res.state.private));
+  isPrivate = !!(res.state && res.state.private);
+  paintPrivate();
   enterRoom(res.code);
   if (res.state) applyFullState(res.state);
   updateInvite();
@@ -499,7 +520,11 @@ function resetRoomUI() {
   privateBadge.classList.add('hidden');
   roomPass.value = '';
   queueSort = 'added';
+  isPrivate = false;
   paintSortBtn();
+  paintPrivate();
+  pwRow.classList.add('hidden');
+  pwHint.classList.add('hidden');
   djRow.classList.add('hidden');
   clearQueueBtn.classList.add('hidden');
   djCheck.checked = false;
@@ -709,6 +734,11 @@ function paintMembers(members, dj) {
       '</li>';
   }).join('');
   const canControlNow = myRole !== 'listener' && (!djOnly || amHost);
+  // Only the host may set, change or clear the password — and it is never
+  // echoed back, so the field starts empty every time you look at it.
+  pwRow.classList.toggle('hidden', !amHost);
+  pwHint.classList.toggle('hidden', !amHost);
+  if (amHost) { pwInput.value = ''; pwSave.textContent = isPrivate ? 'تغییر رمز' : 'گذاشتن رمز'; }
   trackUrl.disabled = !canControlNow;
   loadBtn.disabled = !canControlNow;
   uploadBtn.disabled = !canControlNow;
@@ -942,6 +972,8 @@ function bindSocket(s) {
     if (!f) return;
     djOnly = !!f.djOnly;
     if (f.queueSort) queueSort = f.queueSort === 'votes' ? 'votes' : 'added';
+    if (typeof f.private === 'boolean') isPrivate = f.private;
+    paintPrivate();
     // hostship itself comes from members (isHost flag) — never guess it
     paintMembers(lastMembers, djOnly);
   });
@@ -967,7 +999,9 @@ let lastMembers = [];
 function applyFullState(st) {
   lastMembers = st.members || [];
   queueSort = st.queueSort === 'votes' ? 'votes' : 'added';
+  isPrivate = !!st.private;
   paintMembers(st.members, st.djOnly);
+  paintPrivate();
   applyRoomSpeed(st.speed || 1);
   paintQueue(st.queue);
   paintHistory(st.history);
@@ -1008,7 +1042,9 @@ function autoRejoin() {
       // into the lobby with no explanation at all.
       lobbyError.textContent = err === 'banned'
         ? 'هاست تو را از اتاق بیرون کرد'
-        : 'اتاق ' + code + ' دیگه موجود نیست';
+        : err === 'wrong-password'
+          ? 'رمز اتاق عوض شده — دوباره واردش کن'
+          : 'اتاق ' + code + ' دیگه موجود نیست';
       return;
     }
     onEnteredRoom(res);
