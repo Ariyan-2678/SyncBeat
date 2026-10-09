@@ -8,11 +8,25 @@ const { spawn } = require('child_process');
 const { io } = require('socket.io-client');
 const SyncEcho = require('../public/echo.js');
 
+// The suite reads the SQLite file directly to prove what reached disk. Node
+// prints an ExperimentalWarning for node:sqlite on that require; keep the
+// test output readable without hiding anything else.
+(function silenceSqliteWarning() {
+  const forwarded = process.listeners('warning').slice();
+  process.removeAllListeners('warning');
+  process.on('warning', (w) => {
+    if (w && w.name === 'ExperimentalWarning' && /SQLite/i.test(w.message)) return;
+    forwarded.forEach((fn) => { try { fn(w); } catch (e) { /* listener threw */ } });
+  });
+})();
+
 const ROOT = path.join(__dirname, '..');
 // Unique per run: a server left behind by an earlier run (Windows is slow to
 // release these) would otherwise make this one fail to bind and look like a
-// product bug.
-const PORT = 3099 + (process.pid % 400);
+// product bug. The range is deliberately far away from well-known ports —
+// 3099..3498 overlaps RDP's 3389, which is exactly the kind of collision
+// that reads as a flaky test.
+const PORT = 41000 + (process.pid % 400);
 const BASE = 'http://localhost:' + PORT;
 // second server, used to exercise the TRUST_PROXY=1 rate-limit key and the
 // room cap
@@ -21,24 +35,49 @@ const BASE2 = 'http://localhost:' + PORT2;
 const fail = (m) => { console.error('FAIL:', m); shutdown(1); };
 const ok = (m) => console.log('ok:', m);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Named so a timeout says *which* connection stalled — these run against
+// three different servers and "event timeout: connect" alone is a guessing
+// game. `s.io.uri` is where the client is pointed.
+const where = (s) => (s && s.io && s.io.uri) || 'client';
 const once = (s, ev) => new Promise((res, rej) => {
-  const t = setTimeout(() => rej(new Error('event timeout: ' + ev)), 10000);
+  const t = setTimeout(() => rej(new Error('event timeout: ' + ev + ' on ' + where(s))), 10000);
   s.once(ev, (v) => { clearTimeout(t); res(v); });
 });
 const emitAck = (s, ev, ...args) => new Promise((res, rej) => {
-  const t = setTimeout(() => rej(new Error('ack timeout: ' + ev)), 10000);
+  const t = setTimeout(() => rej(new Error('ack timeout: ' + ev + ' on ' + where(s))), 10000);
   s.emit(ev, ...args, (r) => { clearTimeout(t); res(r); });
 });
 
 let server = null;
 let dataDir = null;
 let dataDir2 = null;
+const extraDataDirs = [];
 const openSockets = [];
 const extraServers = [];
-function client(auth, opts) {
-  const s = io(BASE, { auth, reconnection: false, ...(opts || {}) });
+// Reconnection is left ON deliberately. With it off, a single refused
+// handshake — which happens on a loaded machine in the moment between a
+// child server binding its port and its event loop catching up — is fatal,
+// and the suite reports a timeout that is really a hiccup. Every assertion
+// here awaits an explicit connect or ack, so retrying only delays a genuine
+// failure rather than hiding one.
+function client(auth, opts, base) {
+  const s = io(base || BASE, {
+    auth, reconnection: true, reconnectionDelay: 150, reconnectionDelayMax: 600,
+    reconnectionAttempts: 30, ...(opts || {}),
+  });
   openSockets.push(s);
   return s;
+}
+// Read a room back out of the SQLite file. Used to prove that what we
+// *think* we saved is actually on disk, which a socket-level check cannot.
+function readRoomFrom(dbFile, code) {
+  if (!fs.existsSync(dbFile)) return null;
+  const { DatabaseSync } = require('node:sqlite');
+  const db = new DatabaseSync(dbFile, { readOnly: true });
+  try {
+    const row = db.prepare('SELECT * FROM rooms WHERE code = ?').get(code);
+    return row ? { chat: String(row.chat || ''), queue: String(row.queue || '') } : null;
+  } finally { db.close(); }
 }
 function shutdown(code) {
   openSockets.forEach((s) => { try { s.close(); } catch (e) {} });
@@ -46,16 +85,17 @@ function shutdown(code) {
   extraServers.forEach((s) => { try { s.kill(); } catch (e) {} });
   if (dataDir) { try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch (e) {} }
   if (dataDir2) { try { fs.rmSync(dataDir2, { recursive: true, force: true }); } catch (e) {} }
+  extraDataDirs.forEach((d) => { try { fs.rmSync(d, { recursive: true, force: true }); } catch (e) {} });
   process.exit(code);
 }
 
 // A plain HTTP request that also hands back the body and headers — uploads
 // need to verify what actually comes back off the disk.
-function httpRequest(method, p, headers, body) {
+function httpRequest(method, p, headers, body, base) {
   return new Promise((res, rej) => {
     const h = Object.assign({}, headers);
     if (body) h['Content-Length'] = Buffer.byteLength(body);
-    const req = http.request(BASE + p, { method, headers: h }, (r) => {
+    const req = http.request((base || BASE) + p, { method, headers: h }, (r) => {
       const chunks = [];
       r.on('data', (c) => chunks.push(c));
       r.on('end', () => res({ status: r.statusCode, headers: r.headers, body: Buffer.concat(chunks) }));
@@ -463,6 +503,115 @@ async function waitRunning(srv, label) {
   O2.emit('leave-room');
   await sleep(200);
 
+  // ---- optional room password ----
+  const Priv = client({ guestId: 'guestPw0015', displayName: 'Parisa' });
+  await once(Priv, 'connect');
+  const pc = await emitAck(Priv, 'create-room', { password: '  correct horse  ' });
+  if (!pc || !pc.ok) fail('private create: ' + JSON.stringify(pc));
+  const pcode = pc.code;
+  if (!pc.state || pc.state.private !== true) fail('a passworded room should report private: ' + JSON.stringify(pc.state && pc.state.private));
+  const serialised = JSON.stringify(pc.state || {});
+  if (serialised.indexOf('correct horse') !== -1 || (pc.state && pc.state.passwordHash)) {
+    fail('the room password or its hash leaked into the room state');
+  }
+
+  const NoPw = client({ guestId: 'guestPw0016', displayName: 'Nima' });
+  await once(NoPw, 'connect');
+  const empty = await emitAck(NoPw, 'join-room', pcode, {});
+  if (!empty || empty.ok !== false || empty.error !== 'wrong-password') {
+    fail('joining a private room without a password should be refused: ' + JSON.stringify(empty));
+  }
+  const wrong = await emitAck(NoPw, 'join-room', pcode, { password: 'incorrect horse' });
+  if (!wrong || wrong.ok !== false || wrong.error !== 'wrong-password') {
+    fail('a wrong password should be refused: ' + JSON.stringify(wrong));
+  }
+  const right = await emitAck(NoPw, 'join-room', pcode, { password: 'correct horse' });
+  if (!right || !right.ok) fail('the right password should get in: ' + JSON.stringify(right));
+
+  // an open room is unaffected
+  const Open = client({ guestId: 'guestPw0017', displayName: 'Omid' });
+  await once(Open, 'connect');
+  const openCreate = await emitAck(Open, 'create-room', {});
+  if (!openCreate || !openCreate.ok || !openCreate.state || openCreate.state.private !== false) {
+    fail('a room with no password should stay open: ' + JSON.stringify(openCreate.state && openCreate.state.private));
+  }
+  // ...and the host token still gets you in without re-typing it
+  const again = await emitAck(Priv, 'join-room', pcode, { hostToken: pc.hostToken });
+  if (!again || !again.ok || !again.isHost) fail('the host token should bypass the password: ' + JSON.stringify(again));
+
+  Priv.emit('leave-room'); NoPw.emit('leave-room'); Open.emit('leave-room');
+  await sleep(300);
+  ok('private rooms: password required, hash never broadcast, host token still wins');
+
+  // ---- queue control: move, vote, sort ----
+  const QC = client({ guestId: 'guestQc0018', displayName: 'Qandis' });
+  await once(QC, 'connect');
+  const qcc = await emitAck(QC, 'create-room', {});
+  if (!qcc || !qcc.ok) fail('queue-control create: ' + JSON.stringify(qcc));
+  const qcode = qcc.code;
+
+  const QM = client({ guestId: 'guestQm0019', displayName: 'Mahan' });
+  await once(QM, 'connect');
+  const qmj = await emitAck(QM, 'join-room', qcode, {});
+  if (!qmj || !qmj.ok || qmj.isHost) fail('queue-control member join: ' + JSON.stringify(qmj));
+
+  // the first add becomes the current track, so the queue holds C then M
+  await emitAck(QC, 'queue-add', { type: 'audio', url: 'https://x.test/qa.mp3', title: 'A' });
+  await emitAck(QC, 'queue-add', { type: 'audio', url: 'https://x.test/qc.mp3', title: 'C' });
+  const mAdd = await emitAck(QM, 'queue-add', { type: 'audio', url: 'https://x.test/qm.mp3', title: 'M' });
+  if (!mAdd || !mAdd.ok) fail('queue-control member add: ' + JSON.stringify(mAdd));
+  const ids = {};
+  (await emitAck(QM, 'sync-request')).queue.forEach((t) => { ids[t.title] = t.id; });
+  if (!ids.M || !ids.C) fail('expected C and M in the queue: ' + JSON.stringify(Object.keys(ids)));
+
+  // a member may move their own track to the front...
+  const moved = await emitAck(QM, 'queue-move', { id: ids.M, to: 'next' });
+  const afterMove = (await emitAck(QM, 'sync-request')).queue.map((t) => t.title);
+  if (!moved || !moved.ok || afterMove[0] !== 'M') fail('own track should move to the front: ' + JSON.stringify(afterMove));
+  // ...but not someone else's
+  const notMine = await emitAck(QM, 'queue-move', { id: ids.C, to: 'next' });
+  if (!notMine || notMine.ok !== false || notMine.error !== 'not-allowed') {
+    fail("a member should not be able to move another's track: " + JSON.stringify(notMine));
+  }
+  // the host can move anything
+  const hostMove = await emitAck(QC, 'queue-move', { id: ids.C, to: 'next' });
+  if (!hostMove || !hostMove.ok) fail('host should be able to move any track: ' + JSON.stringify(hostMove));
+  ok('queue reorder: own tracks and the host\'s, nobody else\'s');
+
+  // votes toggle and count
+  const v1 = await emitAck(QM, 'queue-vote', ids.C);
+  if (!v1 || !v1.ok || v1.votes !== 1) fail('first vote should count: ' + JSON.stringify(v1));
+  const v2 = await emitAck(QC, 'queue-vote', ids.C);
+  if (!v2 || !v2.ok || v2.votes !== 2) fail('a second vote should count: ' + JSON.stringify(v2));
+  await sleep(450); // votes are flood-limited to one per 400ms per socket
+  const v3 = await emitAck(QM, 'queue-vote', ids.C);
+  if (!v3 || !v3.ok || v3.votes !== 1) fail('voting again should undo it: ' + JSON.stringify(v3));
+
+  // sorting is the host's call, and it reorders the live queue
+  const notHostSort = await emitAck(QM, 'queue-sort', 'votes');
+  if (!notHostSort || notHostSort.ok !== false || notHostSort.error !== 'host-only') {
+    fail('a member should not be able to sort: ' + JSON.stringify(notHostSort));
+  }
+  const sorted = await emitAck(QC, 'queue-sort', 'votes');
+  if (!sorted || !sorted.ok) fail('host sort failed: ' + JSON.stringify(sorted));
+  const afterSort = (await emitAck(QM, 'sync-request')).queue;
+  if (afterSort[0].title !== 'C' || (afterSort[0].votes || 0) !== 1) {
+    fail('vote sort should put the voted track first: ' + JSON.stringify(afterSort.map((t) => [t.title, t.votes])));
+  }
+  const back = await emitAck(QC, 'queue-sort', 'added');
+  if (!back || !back.ok) fail('host sort back to added failed');
+
+  // a hand reorder takes the queue out of vote-sorting
+  await emitAck(QC, 'queue-sort', 'votes');
+  await emitAck(QM, 'queue-move', { id: ids.M, to: 'next' });
+  const stSort = await emitAck(QM, 'sync-request');
+  if (stSort.queueSort !== 'added') fail('a manual move should stop vote-sorting: ' + stSort.queueSort);
+
+  // votes survive a restart the same way the queue does
+  QC.emit('leave-room'); QM.emit('leave-room');
+  await sleep(300);
+  ok('queue votes and host-controlled sort');
+
   // ---- uploading a file instead of pasting a link ----
   const audioBytes = Buffer.concat([Buffer.from('ID3'), Buffer.alloc(512, 3)]);
   const up = await httpRequest('POST', '/api/upload',
@@ -525,8 +674,29 @@ async function waitRunning(srv, label) {
   // ---- rate limit keyed per forwarded client when TRUST_PROXY=1 ----
   // its own data dir: two processes must never race on the same rooms.json
   dataDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-test-proxy-'));
+  // A stand-in for the YouTube Data API so the search handler's own code —
+  // mapping, truncation, upstream failures — is exercised without a key.
+  const ytStub = http.createServer((req, res) => {
+    const u = new URL(req.url, 'http://x');
+    if (u.searchParams.get('q') === 'upstream-fail') {
+      res.writeHead(500); res.end('nope'); return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ items: [
+      { id: { videoId: 'dQw4w9WgXcQ' }, snippet: {
+        title: 'A & B <script>', channelTitle: 'Someone',
+        thumbnails: { default: { url: 'https://i.ytimg.com/vi/x/default.jpg' } } } },
+      { id: { playlistId: 'PLxx' }, snippet: { title: 'not a video', channelTitle: 'No' } },
+      { id: { videoId: 'abcdefghijk' }, snippet: {
+        title: 'x'.repeat(400), channelTitle: 'y'.repeat(200),
+        thumbnails: { default: { url: 'http://insecure.example/t.jpg' } } } },
+    ] }));
+  });
+  const stubPort = PORT + 3;
+  await new Promise((r) => ytStub.listen(stubPort, r));
   const proxySrv = startServer({
     PORT: String(PORT2), TRUST_PROXY: '1', SB_DATA_DIR: dataDir2, MAX_ROOMS: '2',
+    YOUTUBE_API_KEY: 'stub-key', YOUTUBE_API_BASE: 'http://localhost:' + stubPort,
   });
   extraServers.push(proxySrv);
   await waitRunning(proxySrv, 'TRUST_PROXY server');
@@ -553,6 +723,38 @@ async function waitRunning(srv, label) {
     fail('buckets are not isolated per forwarded client (leftmost entry was trusted?)');
   }
   ok('TRUST_PROXY=1 keys on the rightmost forwarded client, per-IP buckets isolated');
+
+  // ---- YouTube search ----
+  const searchAt = (base, q) =>
+    httpRequest('GET', '/api/search?q=' + encodeURIComponent(q), {}, null, base)
+      .then((r) => ({ status: r.status, body: JSON.parse(r.body.toString('utf8') || '{}') }));
+
+  const sr = await searchAt(pbase, 'some song');
+  if (sr.status !== 200 || !sr.body.ok) fail('search should succeed: ' + JSON.stringify(sr));
+  else {
+    const items = sr.body.results || [];
+    if (items.length !== 2) fail('non-video results should be dropped: ' + JSON.stringify(items.length));
+    if (items[0].id !== 'dQw4w9WgXcQ' || items[0].title !== 'A & B <script>') {
+      fail('first result mapped wrong: ' + JSON.stringify(items[0]));
+    }
+    if (items[1].title.length !== 140) fail('title should be capped at 140: ' + items[1].title.length);
+    if (items[1].channel.length !== 60) fail('channel should be capped at 60: ' + items[1].channel.length);
+    if (/^https:\/\//.test(items[1].thumb || '')) fail('a non-https thumbnail should be dropped: ' + items[1].thumb);
+  }
+  const srFail = await searchAt(pbase, 'upstream-fail');
+  if (srFail.status !== 502 || srFail.body.ok !== false) fail('an upstream failure should be a 502: ' + JSON.stringify(srFail));
+  const srEmpty = await searchAt(pbase, '   ');
+  if (srEmpty.status !== 200 || !srEmpty.body.ok || (srEmpty.body.results || []).length) {
+    fail('an empty query should short-circuit: ' + JSON.stringify(srEmpty));
+  }
+  const srForeign = await httpRequest('GET', '/api/search?q=x', { Origin: 'http://evil.example' }, null, pbase);
+  if (srForeign.status !== 403) fail('search should honour the origin gate: ' + srForeign.status);
+  const srNoKey = await searchAt(BASE, 'anything');
+  if (srNoKey.body.ok !== false || srNoKey.body.error !== 'no-key') {
+    fail('without a key the endpoint should say so: ' + JSON.stringify(srNoKey.body));
+  }
+  ok('YouTube search: maps, caps, drops non-videos, and is honest without a key');
+  ytStub.close();
 
   // ---- ceiling on live rooms (same server, fresh data dir => 0 rooms) ----
   const cap1 = await emitAck(PB, 'create-room', {});
@@ -597,7 +799,7 @@ async function waitRunning(srv, label) {
   // to drop the last write on the floor. SIGTERM now flushes synchronously
   // before anything is torn down.
   await sleep(1600); // let any save queued by earlier tests land first
-  const roomsFile = path.join(dataDir, 'rooms.json');
+  const dbFile = path.join(dataDir, 'syncbeat.db');
   const flagFile = path.join(dataDir, 'raise.sig');
   // Swap in a server we can ask to shut down deterministically. POSIX gets
   // the real signal; Windows cannot deliver one to a child process at all,
@@ -620,8 +822,7 @@ async function waitRunning(srv, label) {
   if (!flushChat || !flushChat.ok) fail('flush setup chat: ' + JSON.stringify(flushChat));
   S.close();
   await sleep(200); // still well inside the 1.5s debounce window
-  const before = fs.existsSync(roomsFile) ? fs.readFileSync(roomsFile, 'utf8') : '';
-  if (before.indexOf(sc.code) !== -1) fail('test precondition: room already flushed before shutdown');
+  if (readRoomFrom(dbFile, sc.code)) fail('test precondition: room already flushed before shutdown');
 
   // Watch for exit BEFORE triggering, and bound the wait: a server that
   // never handles the signal would otherwise hang the suite forever
@@ -637,11 +838,47 @@ async function waitRunning(srv, label) {
     fail('server did not exit on shutdown — the flush handlers are missing');
   }
 
-  const after = fs.existsSync(roomsFile) ? fs.readFileSync(roomsFile, 'utf8') : '';
-  const restored = after ? JSON.parse(after) : {};
-  if (!restored[sc.code]) fail('shutdown did not flush the pending room');
-  if (after.indexOf('flush-me-please') === -1) fail('shutdown did not flush the pending chat');
+  const after = readRoomFrom(dbFile, sc.code);
+  if (!after) fail('shutdown did not flush the pending room');
+  else if (after.chat.indexOf('flush-me-please') === -1) fail('shutdown did not flush the pending chat: ' + after.chat);
   ok('shutdown flushes pending room state to disk');
+
+  // ---- a rooms.json left over from before SQLite is imported on first boot ----
+  const legacyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-legacy-'));
+  extraDataDirs.push(legacyDir);
+  fs.writeFileSync(path.join(legacyDir, 'rooms.json'), JSON.stringify({
+    LEGACY: {
+      hostId: 'u-legacy', hostToken: 'legacy-token-value-0123456789abcd', banned: ['badguest1'],
+      djOnly: false, track: null, queue: [], history: [],
+      chat: [{ id: 'm1', username: 'Old', text: 'hello-legacy', at: Date.now() }],
+      isPlaying: false, position: 0, speed: 1,
+      createdAt: Date.now(), updatedAt: Date.now(), lastActive: Date.now(),
+    },
+  }));
+  const legacyPort = PORT + 2;
+  const legacySrv = startServer({ PORT: String(legacyPort), SB_DATA_DIR: legacyDir }, 'test/raise-sig.js');
+  extraServers.push(legacySrv);
+  await waitRunning(legacySrv, 'legacy-import server');
+  await sleep(300);
+  const L = client({ guestId: 'guestL0014', displayName: 'Leila' }, {}, 'http://localhost:' + legacyPort);
+  await once(L, 'connect');
+  const jl = await emitAck(L, 'join-room', 'LEGACY', {});
+  if (!jl || !jl.ok) fail('a room from rooms.json should still exist: ' + JSON.stringify(jl));
+  else {
+    const chat = (jl.state.chat || []).map((m) => m.text).join(' ');
+    if (chat.indexOf('hello-legacy') === -1) fail('legacy chat did not survive the import: ' + chat);
+    if ((jl.state.members || []).length !== 1) fail('legacy room should be empty on restore');
+  }
+  const Banned = client({ guestId: 'badguest1', displayName: 'Baddy' }, {}, 'http://localhost:' + legacyPort);
+  await once(Banned, 'connect');
+  const bj = await emitAck(Banned, 'join-room', 'LEGACY', {});
+  if (!bj || bj.ok !== false || bj.error !== 'banned') {
+    fail('the imported ban list did not survive: ' + JSON.stringify(bj));
+  }
+  L.emit('leave-room');
+  await sleep(200);
+  ok('a rooms.json from the previous version is imported on boot');
+  legacySrv.kill();
 
   // ---- echo policy: is this media event the user's, or the player's? ----
   // Pure logic from public/echo.js — no server needed, but it decides whether

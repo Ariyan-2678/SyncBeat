@@ -11,6 +11,17 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 
+// Input checking and the small secrets derived from it live apart — see
+// lib/validate.js. Everything here is pure, so keeping it in one place makes
+// it the part of the server you can reason about without the rest loaded.
+const V = require('./lib/validate');
+const {
+  avatarColor, validDisplayName, validGuestId, rid,
+  safePos, cleanTitle, cleanChat, UPLOAD_PATH_RE, makeTrackItem,
+  ownerTag, newOwnerSecret, adoptOwnerSecret,
+  cleanPassword, makePassword, passwordMatches, uploadExtOf,
+} = V;
+
 const app = express();
 const server = http.createServer(app);
 
@@ -127,92 +138,51 @@ function echoKind(room, seq) {
 // queue so everyone can see who added what, but only the holder of the secret
 // can delete the item. guestId cannot do this job — the client picks it, so
 // claiming someone else's is trivial (reproduced before this was added).
-const OWNER_SECRET_RE = /^[A-Za-z0-9_-]{24,64}$/;
-const ownerTag = (secret) =>
-  crypto.createHash('sha256').update(secret).digest('base64url').slice(0, 32);
-const newOwnerSecret = () => crypto.randomBytes(24).toString('base64url');
-function adoptOwnerSecret(v) {
-  return typeof v === 'string' && OWNER_SECRET_RE.test(v) ? v : newOwnerSecret();
-}
+
+// ---------------------------------------------------------- room password
+// Optional: a room with no password behaves exactly as before. Only the hash
+// and its per-room salt are stored and only a boolean is ever broadcast, so
+// the password itself never leaves the creator's browser.
 
 // ---------------------------------------------------------- persistence
 const DATA_DIR = process.env.SB_DATA_DIR || path.join(__dirname, 'data');
-const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
-try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) { /* exists */ }
+const store = require('./lib/store').open(DATA_DIR);
 
-function loadJson(file, fallback) {
-  try {
-    if (!fs.existsSync(file)) return fallback;
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch (e) {
-    console.error('loadJson failed for', file, e.message);
-    return fallback;
-  }
-}
+// Rooms are written one at a time and only when they change. Every keystroke
+// used to serialize and rewrite *every* room on the server into rooms.json.
+const dirty = new Set();
 let saveTimer = null;
-function scheduleSave() {
+function markDirty(code) {
+  if (!code) return;
+  dirty.add(code);
   if (saveTimer) return;
-  saveTimer = setTimeout(() => {
-    saveTimer = null;
-    persistNow();
-  }, 1500);
+  saveTimer = setTimeout(flushDirty, 1500);
   // Never the reason the process stays alive — the listening server is, and
   // shutdown() flushes anything still pending on the way out.
   saveTimer.unref && saveTimer.unref();
 }
-function persistNow() {
-  try {
-    const portable = {};
-    for (const [code, r] of Object.entries(rooms)) {
-      portable[code] = {
-        hostId: r.hostId,
-        hostToken: r.hostToken || null,
-        banned: (r.banned || []).slice(0, 200),
-        djOnly: !!r.djOnly,
-        track: r.track,
-        queue: (r.queue || []).slice(0, 100),
-        history: (r.history || []).slice(-30),
-        chat: (r.chat || []).slice(-100),
-        isPlaying: !!r.isPlaying,
-        position: r.position || 0,
-        speed: VALID_SPEEDS.includes(r.speed) ? r.speed : 1,
-        updatedAt: r.updatedAt || Date.now(),
-        createdAt: r.createdAt || Date.now(),
-        lastActive: r.lastActive || Date.now(),
-      };
+function flushDirty() {
+  saveTimer = null;
+  const codes = Array.from(dirty);
+  dirty.clear();
+  for (const code of codes) {
+    try {
+      const r = rooms[code];
+      if (r) store.putRoom(code, r); else store.deleteRoom(code);
+    } catch (e) {
+      console.error('persist failed for ' + code + ':', e.message);
     }
-    // Atomic write: a crash mid-write must not truncate rooms.json.
-    const tmp = ROOMS_FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(portable, null, 1));
-    fs.renameSync(tmp, ROOMS_FILE);
-  } catch (e) {
-    console.error('persist failed:', e.message);
   }
+}
+// Synchronous, so it is safe on the way out of the process.
+function persistNow() {
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  flushDirty();
 }
 
 // ---------------------------------------------------------- guest identity
 // No passwords: the client sends { guestId, displayName }; the server
 // validates the shape and derives the avatar color from the name.
-function avatarColor(name) {
-  let h = 0;
-  for (let i = 0; i < String(name).length; i++) h = (h * 31 + String(name).charCodeAt(i)) >>> 0;
-  return 'hsl(' + (h % 360) + ' 45% 55%)';
-}
-function validDisplayName(name) {
-  if (typeof name !== 'string') return null;
-  const n = name.trim().replace(/\s+/g, ' ');
-  // 2..20 chars, letters (incl. Persian/Arabic range), digits, _ - .
-  if (!/^[\p{L}\p{N}_.\- ]{2,20}$/u.test(n)) return null;
-  return n;
-}
-function validGuestId(id) {
-  if (typeof id !== 'string') return null;
-  id = id.trim();
-  if (!/^[A-Za-z0-9_-]{6,32}$/.test(id)) return null;
-  return id;
-}
-const rid = () =>
-  Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
 // NOTE: there used to be a GET /api/room/:code here reporting whether a code
 // existed (and how many people were inside). Nothing ever called it, and it
@@ -226,43 +196,64 @@ const rid = () =>
 // unchanged because an upload is just another audio URL.
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch (e) { /* exists */ }
-const UPLOAD_EXT = new Set(['mp3', 'm4a', 'm4b', 'aac', 'ogg', 'oga', 'opus', 'wav', 'flac', 'weba']);
-const EXT_BY_MIME = {
-  'audio/mpeg': 'mp3', 'audio/mp3': 'mp3',
-  'audio/mp4': 'm4a', 'audio/x-m4a': 'm4a', 'audio/aac': 'aac',
-  'audio/ogg': 'ogg', 'audio/opus': 'opus', 'audio/webm': 'weba',
-  'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/flac': 'flac',
-};
+// The shape check lives in lib/validate.js; only the "is it actually on our
+// disk" half needs the filesystem, so it is injected here.
+const validTrackInput = (input) =>
+  V.validTrackInput(input, (name) => fs.existsSync(path.join(UPLOAD_DIR, name)));
 const MAX_UPLOAD_BYTES = parseInt(process.env.MAX_UPLOAD_MB || '30', 10) * 1024 * 1024;
 const MAX_UPLOAD_TOTAL = parseInt(process.env.MAX_UPLOAD_TOTAL_MB || '512', 10) * 1024 * 1024;
 const UPLOAD_TTL_MS = 24 * 3600 * 1000;
 // An upload is addressed as /uploads/<32 hex>.<ext>. Nothing else is ever
 // accepted, so the path cannot be walked out of the uploads directory.
-const UPLOAD_PATH_RE = /^\/uploads\/[a-f0-9]{32}\.[a-z0-9]{2,5}$/;
-let uploadBytesUsed = 0;
-(function measureUploads() {
-  try {
-    for (const f of fs.readdirSync(UPLOAD_DIR)) {
-      try { uploadBytesUsed += fs.statSync(path.join(UPLOAD_DIR, f)).size; } catch (e) { /* raced */ }
-    }
-  } catch (e) { /* no dir yet */ }
-})();
-
-function uploadExtOf(nameHeader, contentType) {
-  const type = String(contentType || '').toLowerCase().split(';')[0].trim();
-  let name = '';
-  try { name = decodeURIComponent(String(nameHeader || '')).trim(); } catch (e) { name = ''; }
-  // Browsers label .m4a / .oga inconsistently, so the extension wins when the
-  // content-type at least agrees this is audio.
-  if (type && type !== 'application/octet-stream' &&
-      type.indexOf('audio/') !== 0 && type !== 'video/mp4') return null;
-  const m = /\.([A-Za-z0-9]{2,5})$/.exec(name);
-  const fromName = m && UPLOAD_EXT.has(m[1].toLowerCase()) ? m[1].toLowerCase() : null;
-  return fromName || EXT_BY_MIME[type] || null;
-}
 
 // Range requests come free with express.static, so seeking works unchanged.
 app.use('/uploads', express.static(UPLOAD_DIR, { index: false, maxAge: '1h' }));
+
+// ---------------------------------------------------------- YouTube search
+// Paste-a-link is the hard part of using this app: finding a URL that
+// actually plays is harder than finding the song. Search needs a key —
+// there is no supported no-key way to search YouTube — so the feature sits
+// behind YOUTUBE_API_KEY and says so rather than pretending.
+//
+// The search happens here, not in the browser: the key must not reach the
+// client, and it sidesteps CORS. Quota is ~100 units per query against a
+// free daily budget of 10,000.
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || '';
+// Overridable so the mapping can be tested against a stub instead of needing
+// a live key and burning quota.
+const YOUTUBE_API_BASE = process.env.YOUTUBE_API_BASE || 'https://www.googleapis.com';
+app.get('/api/search', async (req, res) => {
+  if (!originAllowed(req)) return res.status(403).json({ ok: false, error: 'origin' });
+  if (!YOUTUBE_API_KEY) return res.json({ ok: false, error: 'no-key' });
+  const q = String(req.query.q || '').trim().slice(0, 100);
+  if (!q) return res.json({ ok: true, results: [] });
+  const key = rateKeyOf({ headers: req.headers, address: req.socket.remoteAddress });
+  if (!rateOk('search:' + key, 30, 60000)) {
+    return res.status(429).json({ ok: false, error: 'rate-limited' });
+  }
+  const url = YOUTUBE_API_BASE + '/youtube/v3/search' +
+    '?part=snippet&type=video&videoCategoryId=10&maxResults=8' +
+    '&key=' + encodeURIComponent(YOUTUBE_API_KEY) +
+    '&q=' + encodeURIComponent(q);
+  let j;
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!r.ok) return res.status(502).json({ ok: false, error: 'upstream' });
+    j = await r.json();
+  } catch (e) {
+    return res.status(502).json({ ok: false, error: 'upstream' });
+  }
+  const results = (Array.isArray(j.items) ? j.items : [])
+    .filter((i) => i && i.id && i.id.videoId && i.snippet)
+    .map((i) => ({
+      id: i.id.videoId,
+      title: String(i.snippet.title || '').slice(0, 140),
+      channel: String(i.snippet.channelTitle || '').slice(0, 60),
+      thumb: i.snippet.thumbnails && i.snippet.thumbnails.default
+        ? i.snippet.thumbnails.default.url : null,
+    }));
+  res.json({ ok: true, results });
+});
 
 app.post('/api/upload',
   // Checks that must run before the body is buffered.
@@ -285,18 +276,19 @@ app.post('/api/upload',
     if (!Buffer.isBuffer(buf) || !buf.length) return res.status(400).json({ ok: false, error: 'empty' });
     const ext = uploadExtOf(req.headers['x-filename'], req.headers['content-type']);
     if (!ext) return res.status(415).json({ ok: false, error: 'bad-type' });
-    if (uploadBytesUsed + buf.length > MAX_UPLOAD_TOTAL) {
+    if (store.uploadBytes() + buf.length > MAX_UPLOAD_TOTAL) {
       return res.status(507).json({ ok: false, error: 'storage-full' });
     }
     const id = crypto.randomBytes(16).toString('hex');
-    try { fs.writeFileSync(path.join(UPLOAD_DIR, id + '.' + ext), buf); } catch (e) {
+    const stored = id + '.' + ext;
+    try { fs.writeFileSync(path.join(UPLOAD_DIR, stored), buf); } catch (e) {
       console.error('upload failed:', e.message);
       return res.status(500).json({ ok: false, error: 'write-failed' });
     }
-    uploadBytesUsed += buf.length;
+    store.addUpload(stored, buf.length);
     let name = '';
     try { name = decodeURIComponent(String(req.headers['x-filename'] || '')); } catch (e) { name = ''; }
-    res.json({ ok: true, path: '/uploads/' + id + '.' + ext, title: cleanTitle(name.replace(/\.[^.]+$/, ''), 'آپلود') });
+    res.json({ ok: true, path: '/uploads/' + stored, title: cleanTitle(name.replace(/\.[^.]+$/, ''), 'آپلود') });
   });
 
 // Files nobody points at any more — their room expired, or the track was
@@ -311,22 +303,19 @@ function referencedUploads() {
   return used;
 }
 function sweepUploads() {
-  let files;
-  try { files = fs.readdirSync(UPLOAD_DIR); } catch (e) { return 0; }
-  if (!files.length) return 0;
   const used = referencedUploads();
   const cutoff = Date.now() - UPLOAD_TTL_MS;
   let dropped = 0;
-  for (const f of files) {
-    if (used.has(f)) continue;
-    const full = path.join(UPLOAD_DIR, f);
+  for (const { name, bytes } of store.uploads()) {
+    if (used.has(name)) continue;
     try {
-      const st = fs.statSync(full);
+      const st = fs.statSync(path.join(UPLOAD_DIR, name));
+      // age from the file, so a room that keeps referencing it wins over age
       if (!st.isFile() || st.mtimeMs > cutoff) continue;
-      fs.unlinkSync(full);
-      uploadBytesUsed = Math.max(0, uploadBytesUsed - st.size);
-      dropped++;
-    } catch (e) { /* raced with another pass */ }
+      fs.unlinkSync(path.join(UPLOAD_DIR, name));
+    } catch (e) { continue; /* already gone */ }
+    store.removeUpload(name);
+    dropped += bytes;
   }
   return dropped;
 }
@@ -345,10 +334,11 @@ setInterval(() => {
 // }
 const rooms = {};
 (function restoreRooms() {
-  const saved = loadJson(ROOMS_FILE, {});
+  const saved = store.allRooms();
   for (const [code, s] of Object.entries(saved)) {
     if (!code || !s) continue;
     rooms[code] = {
+      code,
       hostId: s.hostId || null,
       hostToken: typeof s.hostToken === 'string' ? s.hostToken : null,
       banned: Array.isArray(s.banned) ? s.banned.slice(0, 200) : [],
@@ -360,6 +350,9 @@ const rooms = {};
       isPlaying: false, // never resume playing after a restart
       position: typeof s.position === 'number' ? s.position : 0,
       seq: 0,
+      queueSort: s.queueSort === 'votes' ? 'votes' : 'added',
+      passwordHash: s.passwordHash || null,
+      passwordSalt: s.passwordSalt || null,
       updatedAt: Date.now(),
       updatedAtMono: monoNow(),
       createdAt: s.createdAt || Date.now(),
@@ -418,6 +411,9 @@ function roomState(room) {
     hostId: room.hostId,
     djOnly: !!room.djOnly,
     speed: VALID_SPEEDS.includes(room.speed) ? room.speed : 1,
+    // only a boolean: the hash never leaves the server
+    private: !!room.passwordHash,
+    queueSort: room.queueSort === 'votes' ? 'votes' : 'added',
     seq: room.seq || 0,
   };
 }
@@ -437,56 +433,20 @@ function tickState(room) {
 }
 function touch(room) {
   room.lastActive = Date.now();
-  scheduleSave();
+  markDirty(room.code);
 }
-
-const VALID_TRACK_TYPES = ['audio', 'youtube', 'soundcloud'];
 const VALID_EMOJI = ['❤️', '🔥', '👏', '😂', '😮', '👎', '🎵'];
-function safePos(p) {
-  return typeof p === 'number' && isFinite(p) && p >= 0 ? p : null;
+
+// Votes are advisory — the host still decides what plays — but a group needs
+// a way to say "this one next" without everyone shouting in chat.
+function sortQueue(room) {
+  if (room.queueSort !== 'votes') return;
+  // Array#sort is stable, so equal counts keep the order they were added in
+  room.queue.sort((a, b) => (b.votes || 0) - (a.votes || 0));
 }
-function cleanTitle(t, fallback) {
-  if (typeof t === 'string') {
-    t = t.trim().slice(0, 140);
-    if (t) return t;
-  }
-  return fallback;
-}
-function cleanChat(text) {
-  if (typeof text !== 'string') return null;
-  const t = text.trim().replace(/\s+/g, ' ');
-  if (!t || t.length > 500) return null;
-  return t;
-}
-function validTrackInput(input) {
-  const raw = input || {};
-  const type = raw.type;
-  if (!VALID_TRACK_TYPES.includes(type) || typeof raw.url !== 'string') return null;
-  const url = raw.url.trim();
-  if (!url || url.length > 2048) return null;
-  if (type === 'youtube') {
-    if (!/^[\w-]{11}$/.test(url)) return null;
-  } else if (type === 'audio' && UPLOAD_PATH_RE.test(url)) {
-    // One of our own uploads. The path is fully server-generated so it cannot
-    // escape the uploads directory, but the file still has to be there.
-    if (!fs.existsSync(path.join(UPLOAD_DIR, url.slice(8)))) return null;
-  } else if (!/^https?:\/\//i.test(url)) return null;
-  return { type, url };
-}
-function makeTrackItem(input, title, user) {
-  return {
-    id: rid(),
-    type: input.type,
-    url: input.url,
-    title: cleanTitle(title, input.type === 'youtube' ? 'YouTube · ' + input.url : input.url.slice(0, 80)),
-    addedBy: {
-      userId: user.id,
-      guestId: user.guestId,
-      username: user.username,
-      ownerId: user.ownerTag, // hash — safe to broadcast, useless without the secret
-    },
-    addedAt: Date.now(),
-  };
+function canManageItem(room, socket, item) {
+  if (!item || !item.addedBy) return false;
+  return roomHost(socket, room) || item.addedBy.ownerId === socket.user.ownerTag;
 }
 function memberOf(room, socket) {
   return room.members[socket.id] || null;
@@ -594,10 +554,11 @@ setInterval(() => {
   for (const [code, r] of Object.entries(rooms)) {
     if (liveMemberCount(r) === 0 && (r.lastActive || 0) < cutoff) {
       delete rooms[code];
+      markDirty(code); // flushDirty turns a missing room into a DELETE
       dropped++;
     }
   }
-  if (dropped) { console.log('swept rooms:', dropped); scheduleSave(); }
+  if (dropped) { console.log('swept rooms:', dropped); }
 }, 10 * 60 * 1000).unref();
 
 // ---------------------------------------------------------- socket identity (guest)
@@ -643,7 +604,11 @@ io.on('connection', (socket) => {
     const code = makeCode();
     // Secret host capability — returned ONLY to the creator here.
     const hostToken = crypto.randomBytes(24).toString('base64url');
+    // Optional: no password means an open room, exactly as before.
+    const pw = cleanPassword(opts && opts.password);
+    const locked = pw ? makePassword(pw) : { passwordSalt: null, passwordHash: null };
     rooms[code] = {
+      code,
       hostId: null,
       hostToken,
       banned: [],
@@ -655,6 +620,9 @@ io.on('connection', (socket) => {
       isPlaying: false,
       position: 0,
       seq: 0,
+      passwordSalt: locked.passwordSalt,
+      passwordHash: locked.passwordHash,
+      queueSort: 'added',
       updatedAt: Date.now(),
       updatedAtMono: monoNow(),
       createdAt: Date.now(),
@@ -712,6 +680,12 @@ io.on('connection', (socket) => {
     const wantListener = !!(opts && opts.asListener);
     const token = opts && typeof opts.hostToken === 'string' ? opts.hostToken : null;
     const claimed = !!(token && room.hostToken && token === room.hostToken);
+    // A private room needs its password, unless you are proving hostship
+    // with the token — which the creator already holds.
+    if (!claimed && !passwordMatches(room, cleanPassword(opts && opts.password))) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'wrong-password' });
+      return;
+    }
     // Re-adopt the queue-ownership secret this browser already holds, so a
     // refresh does not lose the right to delete its own queued tracks.
     if (opts && opts.ownerSecret !== undefined) {
@@ -865,6 +839,111 @@ io.on('connection', (socket) => {
     touch(room);
     io.to(joinedCode).emit('queue-update', room.queue);
     if (typeof cb === 'function') cb({ ok: true });
+  });
+
+  // Reorder: 'next' puts it at the front, 'up'/'down' nudge it. Only the
+  // person who queued it (or the host) may move it — same rule as deleting.
+  socket.on('queue-move', (args, cb) => {
+    const room = needRoom();
+    if (!room) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'no-room' });
+      return;
+    }
+    const member = memberOf(room, socket);
+    if (isListener(member)) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'not-allowed' });
+      return;
+    }
+    const id = args && args.id;
+    const where = args && args.to;
+    const i = room.queue.findIndex((t) => t.id === id);
+    if (i < 0) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'not-found' });
+      return;
+    }
+    if (!canManageItem(room, socket, room.queue[i])) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'not-allowed' });
+      return;
+    }
+    const at = where === 'next' ? 0
+      : where === 'up' ? Math.max(0, i - 1)
+      : where === 'down' ? Math.min(room.queue.length - 1, i + 1)
+      : -1;
+    if (at < 0 || at === i) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'bad-target' });
+      return;
+    }
+    const [item] = room.queue.splice(i, 1);
+    room.queue.splice(at, 0, item);
+    // A hand-reordered queue is asking to be left alone; a vote sort would
+    // undo it on the next vote.
+    if (room.queueSort !== 'added') {
+      room.queueSort = 'added';
+      io.to(joinedCode).emit('room-flags', {
+        djOnly: room.djOnly, hostId: room.hostId, queueSort: room.queueSort,
+      });
+    }
+    touch(room);
+    io.to(joinedCode).emit('queue-update', room.queue);
+    if (typeof cb === 'function') cb({ ok: true });
+  });
+
+  // One vote per member per track, toggled. Listeners can vote — it is not
+  // playback control, it is a opinion about what to play.
+  socket.on('queue-vote', (trackId, cb) => {
+    const room = needRoom();
+    if (!room) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'no-room' });
+      return;
+    }
+    if (!memberOf(room, socket)) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'no-room' });
+      return;
+    }
+    const now = Date.now();
+    if (now - (socket._lastVote || 0) < 400) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'slow-down' });
+      return;
+    }
+    socket._lastVote = now;
+    const item = room.queue.find((t) => t.id === trackId);
+    if (!item) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'not-found' });
+      return;
+    }
+    const tag = socket.user.ownerTag;
+    item.voters = Array.isArray(item.voters) ? item.voters : [];
+    const at = item.voters.indexOf(tag);
+    if (at >= 0) item.voters.splice(at, 1); else item.voters.push(tag);
+    item.votes = item.voters.length;
+    sortQueue(room);
+    touch(room);
+    io.to(joinedCode).emit('queue-update', room.queue);
+    if (typeof cb === 'function') cb({ ok: true, votes: item.votes });
+  });
+
+  socket.on('queue-sort', (mode, cb) => {
+    const room = needRoom();
+    if (!room) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'no-room' });
+      return;
+    }
+    if (!roomHost(socket, room)) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'host-only' });
+      return;
+    }
+    if (mode !== 'added' && mode !== 'votes') {
+      if (typeof cb === 'function') cb({ ok: false, error: 'bad-sort' });
+      return;
+    }
+    room.queueSort = mode;
+    sortQueue(room);
+    touch(room);
+    io.to(joinedCode).emit('room-flags', {
+      djOnly: room.djOnly, hostId: room.hostId, queueSort: room.queueSort,
+    });
+    io.to(joinedCode).emit('queue-update', room.queue);
+    if (typeof cb === 'function') cb({ ok: true, queueSort: room.queueSort });
   });
 
   function advance(room, code) {
@@ -1086,7 +1165,9 @@ io.on('connection', (socket) => {
     }
     room.djOnly = !!on;
     touch(room);
-    io.to(joinedCode).emit('room-flags', { djOnly: room.djOnly, hostId: room.hostId });
+    io.to(joinedCode).emit('room-flags', {
+      djOnly: room.djOnly, hostId: room.hostId, queueSort: room.queueSort || 'added',
+    });
     if (typeof cb === 'function') cb({ ok: true, djOnly: room.djOnly });
   });
 

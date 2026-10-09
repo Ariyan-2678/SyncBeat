@@ -8,7 +8,7 @@
     "test": "node test/smoke-client.js && node test/e2e.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22.5"
   },
   "dependencies": {
     "express": "^4.19.2",

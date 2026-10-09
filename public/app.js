@@ -12,9 +12,12 @@ const userChip = $('userChip'), userAvatar = $('userAvatar'), userName = $('user
 const createBtn = $('createBtn'), joinBtn = $('joinBtn'), codeInput = $('codeInput');
 const listenerCheck = $('listenerCheck'), lobbyError = $('lobbyError');
 const roomCode = $('roomCode'), copyBtn = $('copyBtn'), shareBtn = $('shareBtn'), leaveBtn = $('leaveBtn');
+const roomPass = $('roomPass'), privateBadge = $('privateBadge');
+const searchBox = $('searchBox'), searchForm = $('searchForm'), searchInput = $('searchInput'),
+  searchBtn = $('searchBtn'), searchList = $('searchList'), searchHint = $('searchHint');
 const userCount = $('userCount'), membersList = $('membersList');
 const djBadge = $('djBadge'), djRow = $('djRow'), djCheck = $('djCheck');
-const clearQueueBtn = $('clearQueueBtn');
+const clearQueueBtn = $('clearQueueBtn'), sortBtn = $('sortBtn');
 const inviteBox = $('inviteBox'), inviteLink = $('inviteLink'), qrImg = $('qrImg');
 const trackUrl = $('trackUrl'), loadBtn = $('loadBtn');
 const uploadBtn = $('uploadBtn'), trackFile = $('trackFile');
@@ -75,6 +78,22 @@ function saveOwnerSecret(code, secret) {
   } catch (e) {}
 }
 let MY_OWNER_TAG = null;
+
+// Room passwords, kept so a reconnect (or a later visit to the invite link)
+// does not have to ask again. Same shape and lifetime as the host tokens.
+function roomPasswords() {
+  try { return JSON.parse(localStorage.getItem('sb-roompw') || '{}'); } catch (e) { return {}; }
+}
+function getRoomPassword(code) { return roomPasswords()[code] || ''; }
+function saveRoomPassword(code, pw) {
+  try {
+    const m = roomPasswords();
+    if (pw) m[code] = pw; else delete m[code];
+    const keys = Object.keys(m);
+    if (keys.length > 50) keys.slice(0, keys.length - 50).forEach((k) => delete m[k]);
+    localStorage.setItem('sb-roompw', JSON.stringify(m));
+  } catch (e) {}
+}
 
 function validNameLocal(n) {
   n = String(n == null ? '' : n).trim().replace(/\s+/g, ' ');
@@ -196,7 +215,20 @@ let pending = null;
 let scPlaying = false, scLastPos = 0, scActionAt = 0;
 const SC_ECHO_MS = 1500;
 let myRole = 'member', amHost = false, djOnly = false;
+let queueSort = 'added';
 let currentCode = null;
+function paintSortBtn() {
+  sortBtn.classList.toggle('hidden', !amHost);
+  sortBtn.textContent = queueSort === 'votes' ? 'مرتب: رأی' : 'مرتب: اضافه‌شده';
+}
+sortBtn.onclick = () => {
+  if (!socket) return;
+  socket.emit('queue-sort', queueSort === 'votes' ? 'added' : 'votes', (res) => {
+    if (!res || !res.ok) { setStatus('فقط هاست صف را مرتب می‌کنه'); return; }
+    queueSort = res.queueSort === 'votes' ? 'votes' : 'added';
+    paintSortBtn();
+  });
+};
 
 // local prefs (not synced)
 let muted = false;
@@ -249,7 +281,7 @@ themeToggle.addEventListener('click', () => {
 createBtn.onclick = () => {
   if (!socket) return;
   lobbyError.textContent = '';
-  socket.emit('create-room', (res) => {
+  socket.emit('create-room', { password: roomPass.value }, (res) => {
     if (!res || !res.ok) {
       lobbyError.textContent =
         res && res.error === 'rate-limited' ? 'خیلی سریع می‌سازی — چند لحظه صبر کن'
@@ -273,12 +305,15 @@ function doJoin(code, asListener) {
     asListener: !!asListener,
     hostToken: getHostToken(code),
     ownerSecret: getOwnerSecret(code),
+    password: roomPass.value || getRoomPassword(code),
   }, (res) => {
     if (!res || !res.ok) {
       const err = res && res.error;
       lobbyError.textContent = err === 'banned' ? 'هاست تو رو از این اتاق بیرون کرده'
+        : err === 'wrong-password' ? 'رمز اتاق درست نیست'
         : err === 'rate-limited' ? 'خیلی سریع می‌ایی — چند لحظه صبر کن'
         : 'اتاقی با این کد پیدا نشد';
+      if (err === 'wrong-password') { try { roomPass.focus(); } catch (e) {} }
       return;
     }
     onEnteredRoom(res);
@@ -286,6 +321,75 @@ function doJoin(code, asListener) {
 }
 joinForm.addEventListener('submit', (e) => { e.preventDefault(); joinBtn.click(); });
 trackForm.addEventListener('submit', (e) => { e.preventDefault(); loadBtn.click(); });
+
+// ============================================================ search YouTube
+// Paste-a-link is the hard part of using this app, so the link can be looked
+// up instead. The search is answered by our own server, which holds the API
+// key — the browser never sees it.
+let searchBusy = false;
+function runSearch() {
+  if (searchBusy) return;
+  const q = searchInput.value.trim();
+  if (!q) { searchList.classList.add('hidden'); return; }
+  searchBusy = true;
+  searchBtn.disabled = true;
+  searchHint.classList.add('hidden');
+  fetch('/api/search?q=' + encodeURIComponent(q))
+    .then((r) => r.json())
+    .then((res) => {
+      if (!res || !res.ok) {
+        showSearchHint(res && res.error === 'no-key'
+          ? 'جستجو خاموشه — متغیر YOUTUBE_API_KEY را روی سرور بذار.'
+          : res && res.error === 'rate-limited' ? 'خیلی سریع جستجو می‌کنی — کمی صبر کن'
+          : 'جستجو جواب نداد');
+        return;
+      }
+      paintSearch(res.results || []);
+    })
+    .catch(() => showSearchHint('جستجو جواب نداد'))
+    .finally(() => { searchBusy = false; searchBtn.disabled = false; });
+}
+function showSearchHint(msg) {
+  searchHint.textContent = msg;
+  searchHint.classList.remove('hidden');
+  searchList.classList.add('hidden');
+}
+function paintSearch(list) {
+  if (!list.length) { showSearchHint('چیزی پیدا نشد'); return; }
+  searchList.innerHTML = list.map((r) => {
+    // Only a real https thumbnail — an arbitrary scheme in an <img> src is
+    // not something to take on trust, even from our own upstream.
+    const thumb = /^https:\/\//.test(r.thumb || '') ? r.thumb : null;
+    return '<li class="s-item">' +
+      (thumb ? '<img class="s-thumb" src="' + esc(thumb) + '" alt="" loading="lazy" width="56" height="42" />' : '') +
+      '<span class="s-text">' +
+        '<span class="s-title">' + esc(r.title) + '</span>' +
+        '<span class="s-by">' + esc(r.channel || '') + '</span>' +
+      '</span>' +
+      '<button class="chip-btn s-add" type="button" data-id="' + esc(r.id) +
+      '" data-title="' + esc(r.title) + '">+ صف</button>' +
+      '</li>';
+  }).join('');
+  searchHint.classList.add('hidden');
+  searchList.classList.remove('hidden');
+}
+searchBtn.onclick = runSearch;
+searchForm.addEventListener('submit', (e) => { e.preventDefault(); runSearch(); });
+searchList.addEventListener('click', (e) => {
+  const b = e.target.closest('.s-add');
+  if (!b || !socket) return;
+  if (!canControlClient()) {
+    setStatus(myRole === 'listener' ? 'شنونده نمی‌تواند آهنگ اضافه کند 🎧' : 'فعلاً فقط DJ کنترل می‌کند');
+    return;
+  }
+  socket.emit('queue-add', {
+    type: 'youtube',
+    url: b.getAttribute('data-id'),
+    title: b.getAttribute('data-title'),
+  }, (res) => {
+    setStatus(res && res.ok ? 'به صف اضافه شد ✓' : 'خطا در افزودن');
+  });
+});
 
 // ============================================================ upload from disk
 // Links still work, but finding a host that permits hotlinking is a chore —
@@ -352,6 +456,8 @@ function onEnteredRoom(res) {
   MY_OWNER_TAG = res.ownerTag || null;
   myRole = res.role || 'member';
   amHost = !!res.isHost;
+  if (res.state && res.state.private) saveRoomPassword(res.code, roomPass.value || getRoomPassword(res.code));
+  privateBadge.classList.toggle('hidden', !(res.state && res.state.private));
   enterRoom(res.code);
   if (res.state) applyFullState(res.state);
   updateInvite();
@@ -383,10 +489,16 @@ function resetRoomUI() {
   transport.classList.add('hidden');
   ytWrap.classList.add('hidden'); scWrap.classList.add('hidden');
   queueList.innerHTML = ''; historyList.innerHTML = ''; chatList.innerHTML = ''; membersList.innerHTML = '';
+  searchList.innerHTML = ''; searchList.classList.add('hidden'); searchHint.classList.add('hidden');
+  searchInput.value = '';
   historyBox.classList.add('hidden');
   queueCount.textContent = '0'; userCount.textContent = '1';
   inviteBox.classList.add('hidden');
   djBadge.classList.add('hidden');
+  privateBadge.classList.add('hidden');
+  roomPass.value = '';
+  queueSort = 'added';
+  paintSortBtn();
   djRow.classList.add('hidden');
   clearQueueBtn.classList.add('hidden');
   djCheck.checked = false;
@@ -512,25 +624,53 @@ djCheck.addEventListener('change', () => {
 function paintQueue(q) {
   q = Array.isArray(q) ? q : [];
   queueCount.textContent = q.length;
-  queueList.innerHTML = q.map((t) => {
+  queueList.innerHTML = q.map((t, i) => {
     // Match on the server-issued hash, not guestId — guestId is ours to
     // declare, so the button would appear on other people's tracks too.
     const mine = !!(MY_OWNER_TAG && t.addedBy && t.addedBy.ownerId === MY_OWNER_TAG);
-    const canDel = amHost || mine;
+    const canManage = amHost || mine;
+    const voted = !!(MY_OWNER_TAG && Array.isArray(t.voters) && t.voters.indexOf(MY_OWNER_TAG) >= 0);
+    const votes = t.votes || 0;
+    const id = 'data-id="' + esc(t.id) + '"';
     return '<li class="q-item">' +
       '<span class="q-type">' + esc(t.type === 'youtube' ? 'YT' : t.type === 'soundcloud' ? 'SC' : 'MP3') + '</span>' +
       '<span class="q-title">' + esc(t.title || t.url) + '</span>' +
       '<span class="q-by">' + esc((t.addedBy && t.addedBy.username) || '') + '</span>' +
-      (canDel ? '<button class="chip-btn q-del" type="button" data-id="' + esc(t.id) + '">حذف</button>' : '') +
+      '<span class="q-tools">' +
+        (myRole === 'listener' ? '' :
+          '<button class="chip-btn q-vote' + (voted ? ' on' : '') + '" type="button" ' + id +
+          ' aria-pressed="' + (voted ? 'true' : 'false') + '" title="رأی">' +
+          (voted ? '♥' : '♡') + (votes ? ' ' + votes : '') + '</button>') +
+        (canManage
+          ? (i > 0 ? '<button class="chip-btn q-move narrow" type="button" ' + id + ' data-to="up" title="بالاتر">↑</button>' : '') +
+            '<button class="chip-btn q-move" type="button" ' + id + ' data-to="next" title="بعدی پخش شود">⏭ بعدی</button>' +
+            '<button class="chip-btn q-del" type="button" ' + id + '>حذف</button>'
+          : '') +
+      '</span>' +
       '</li>';
   }).join('') || '<li class="q-empty">صف خالیه</li>';
 }
 queueList.addEventListener('click', (e) => {
-  const b = e.target.closest('.q-del');
+  const b = e.target.closest('button[data-id]');
   if (!b || !socket) return;
-  socket.emit('queue-remove', b.getAttribute('data-id'), (res) => {
-    if (res && !res.ok) setStatus('اجازه نداری');
-  });
+  const id = b.getAttribute('data-id');
+  if (b.classList.contains('q-vote')) {
+    socket.emit('queue-vote', id, (res) => {
+      if (res && !res.ok) setStatus(res.error === 'slow-down' ? 'یک‌خرده صبر کن' : 'رأی ثبت نشد');
+    });
+    return;
+  }
+  if (b.classList.contains('q-move')) {
+    socket.emit('queue-move', { id: id, to: b.getAttribute('data-to') }, (res) => {
+      if (res && !res.ok) setStatus('اجازه نداری');
+    });
+    return;
+  }
+  if (b.classList.contains('q-del')) {
+    socket.emit('queue-remove', id, (res) => {
+      if (res && !res.ok) setStatus('اجازه نداری');
+    });
+  }
 });
 function paintHistory(h) {
   h = Array.isArray(h) ? h : [];
@@ -571,8 +711,11 @@ function paintMembers(members, dj) {
   trackUrl.disabled = !canControlNow;
   loadBtn.disabled = !canControlNow;
   uploadBtn.disabled = !canControlNow;
+  searchBox.classList.toggle('hidden', !canControlNow);
+  if (!canControlNow) { searchList.classList.add('hidden'); searchHint.classList.add('hidden'); }
   djRow.classList.toggle('hidden', !amHost);
   clearQueueBtn.classList.toggle('hidden', !amHost);
+  paintSortBtn();
   if (amHost) djCheck.checked = djOnly;
 }
 membersList.addEventListener('click', (e) => {
@@ -769,263 +912,9 @@ function setPlayingUI(playing) {
 audio.addEventListener('play', () => setPlayingUI(true));
 audio.addEventListener('pause', () => setPlayingUI(false));
 
-// ============================================================ sync core
-// Applying a command that came from the server must not be bounced straight
-// back. A plain time window does not work: <audio> can take seconds to
-// actually start, so its 'play' event lands long after the window closed and
-// looks like a local ▶ — and if the room has moved on by then, forwarding it
-// would undo the newer command (host pauses, a buffering client's late play
-// resumes everyone). Each remote command therefore registers the transitions
-// it expects plus the seq it was given; when the matching event fires it is
-// sent back with that seq, and the server tells an echo from a real action.
-// Run fn() while remembering what it is going to make the player emit —
-// see public/echo.js for how the two cases are told apart.
-function withSuppress(fn, kinds, seq) {
-  if (typeof seq === 'number') echo.expectEcho(kinds || ['play', 'pause', 'seeked'], seq);
-  else echo.expectDrop(['pause', 'seeked', 'ended']);
-  try { fn(); } catch (e) { /* player may not be ready yet */ }
-}
-function emitControl(kind, event, value) {
-  if (!socket) return;
-  const c = echo.resolve(kind);
-  if (c.send) socket.emit(event, value, c.seq);
-}
-function stopAllPlayers() {
-  if (!audio.paused) { try { audio.pause(); } catch (e) {} }
-  try { audio.removeAttribute('src'); audio.load(); } catch (e) {}
-  if (ytPlayer && ytPlayer.stopVideo) { try { ytPlayer.stopVideo(); } catch (e) {} }
-  if (scPlayer && scPlayer.pause) { try { scPlayer.pause(); } catch (e) {} }
-  scPlaying = false;
-  scActionAt = Date.now();
-  setPlayingUI(false);
-}
-function updateAddBtn() {
-  loadBtn.textContent = currentTrack ? '+ صف' : '▶ پخش';
-}
-function loadTrack(track) {
-  pending = null; // belongs to the previous track, if it ever became ready
-  withSuppress(() => stopAllPlayers());
-  currentTrack = track;
-  updateAddBtn();
-  if (!track) {
-    emptyMsg.classList.remove('hidden');
-    trackMeta.classList.add('hidden');
-    transport.classList.add('hidden');
-    ytWrap.classList.add('hidden'); scWrap.classList.add('hidden');
-    setPlayingUI(false);
-    return;
-  }
-  emptyMsg.classList.add('hidden');
-  trackMeta.classList.remove('hidden');
-  transport.classList.remove('hidden');
-  trackTitle.textContent = track.title || track.url;
-  trackBy.textContent = 'اضافه‌شده توسط ' + ((track.addedBy && track.addedBy.username) || '؟') +
-    (track.type === 'youtube' ? ' · یوتیوب' : track.type === 'soundcloud' ? ' · ساندکلاد' : ' · MP3');
-  const isAudio = track.type === 'audio', isYt = track.type === 'youtube', isSc = track.type === 'soundcloud';
-  audio.classList.add('hidden');
-  ytWrap.classList.toggle('hidden', !isYt);
-  scWrap.classList.toggle('hidden', !isSc);
-  seekBar.value = 0; updateSeekFill();
-  timeCur.textContent = '0:00'; timeDur.textContent = '0:00';
-  if (isAudio) { audio.src = track.url; audio.load(); applyVolume(); applySpeed(); }
-  else if (isYt) loadYouTube(track.url);
-  else if (isSc) loadSoundCloud(track.url);
-}
-function getPosition() {
-  if (!currentTrack) return 0;
-  if (currentTrack.type === 'audio') return audio.currentTime || 0;
-  if (currentTrack.type === 'youtube' && ytPlayer && ytPlayer.getCurrentTime) {
-    try { return ytPlayer.getCurrentTime(); } catch (e) { return 0; }
-  }
-  if (currentTrack.type === 'soundcloud') return scLastPos;
-  return 0;
-}
-function getDuration() {
-  if (!currentTrack) return 0;
-  if (currentTrack.type === 'audio') return audio.duration || 0;
-  if (currentTrack.type === 'youtube' && ytPlayer && ytPlayer.getDuration) {
-    try { return ytPlayer.getDuration() || 0; } catch (e) { return 0; }
-  }
-  if (currentTrack.type === 'soundcloud') return scDuration || 0;
-  return 0;
-}
-// `seq` is the command id the server attached to this instruction; it is only
-// remembered so a player that becomes ready later still reports the right one.
-function stashPending(isPlaying, position, seq) {
-  pending = { isPlaying: isPlaying, position: position, seq: seq };
-}
-function doPlay(position, seq) {
-  if (!currentTrack) return;
-  if (currentTrack.type === 'audio') {
-    if (typeof position === 'number' && Math.abs(audio.currentTime - position) > SYNC_DRIFT) audio.currentTime = position;
-    applyVolume(); applySpeed();
-    audio.play().catch(() => setStatus('برای پخش، یه‌بار روی صفحه کلیک کن.'));
-  } else if (currentTrack.type === 'youtube') {
-    if (!ytPlayer) { stashPending(true, position || 0, seq); return; }
-    try {
-      if (typeof position === 'number' && Math.abs(ytPlayer.getCurrentTime() - position) > SYNC_DRIFT)
-        ytPlayer.seekTo(position, true);
-      applyVolume(); applySpeed();
-      ytPlayer.playVideo();
-    } catch (e) {}
-  } else if (currentTrack.type === 'soundcloud') {
-    if (!scPlayer) { stashPending(true, position || 0, seq); return; }
-    if (typeof position === 'number' && Math.abs(scLastPos - position) > SYNC_DRIFT) {
-      scPlayer.seekTo(position * 1000); scActionAt = Date.now();
-    }
-    scActionAt = Date.now();
-    applyVolume();
-    scPlayer.play();
-  }
-}
-function doPause(position, seq) {
-  if (!currentTrack) return;
-  if (currentTrack.type === 'audio') {
-    if (typeof position === 'number') { try { audio.currentTime = position; } catch (e) {} }
-    audio.pause();
-  } else if (currentTrack.type === 'youtube') {
-    if (!ytPlayer) { stashPending(false, position || 0, seq); return; }
-    try {
-      if (typeof position === 'number') ytPlayer.seekTo(position, true);
-      ytPlayer.pauseVideo();
-    } catch (e) {}
-  } else if (currentTrack.type === 'soundcloud') {
-    if (!scPlayer) { stashPending(false, position || 0, seq); return; }
-    try {
-      if (typeof position === 'number') scPlayer.seekTo(position * 1000);
-      scActionAt = Date.now();
-      scPlayer.pause();
-    } catch (e) {}
-  }
-}
-function doSeek(position, seq) {
-  if (!currentTrack || typeof position !== 'number') return;
-  if (currentTrack.type === 'audio') { try { audio.currentTime = position; } catch (e) {} }
-  else if (currentTrack.type === 'youtube') {
-    if (!ytPlayer) { stashPending(true, position, seq); return; }
-    try { ytPlayer.seekTo(position, true); } catch (e) {}
-  } else if (currentTrack.type === 'soundcloud') {
-    if (!scPlayer) { stashPending(true, position, seq); return; }
-    scActionAt = Date.now();
-    try { scPlayer.seekTo(position * 1000); } catch (e) {}
-  }
-}
-function emitEnded() {
-  // An 'ended' we caused (swapping tracks) must not advance the queue, and
-  // there is no seq on this event to let the server decide — so it is simply
-  // dropped when it is ours.
-  const ours = echo.consumeDrop('ended');
-  if (!ours && socket && currentTrack) socket.emit('track-ended');
-  setPlayingUI(false);
-}
-
-// audio -> server
-audio.addEventListener('play', () => emitControl('play', 'play', audio.currentTime));
-audio.addEventListener('pause', () => {
-  if (audio.ended) return;
-  emitControl('pause', 'pause', audio.currentTime);
-});
-audio.addEventListener('seeked', () => emitControl('seeked', 'seek', audio.currentTime));
-audio.addEventListener('ended', emitEnded);
-
-// youtube
-let ytLoadToken = 0;
-function loadYouTube(videoId, attempt) {
-  attempt = attempt || 0;
-  const token = ++ytLoadToken;
-  if (!ytReady) {
-    // The iframe API is a third-party script. Retrying keeps the player
-    // usable when it is merely slow, but without a cap this would spin
-    // forever when it is blocked — and without the token a retry queued for
-    // an older video would clobber the one the user just picked.
-    if (attempt >= 100) { setStatus('یوتیوب لود نشد — اینترنتت رو چک کن'); return; }
-    setTimeout(() => { if (token === ytLoadToken) loadYouTube(videoId, attempt + 1); }, 300);
-    return;
-  }
-  if (!ytPlayer) {
-    ytPlayer = new YT.Player('ytPlayer', {
-      videoId,
-      playerVars: { rel: 0, playsinline: 1 },
-      events: {
-        onReady: (e) => {
-          applyVolume(); applySpeed();
-          if (pending) {
-            const p = pending; pending = null;
-            withSuppress(() => {
-              doSeek(p.position);
-              if (p.isPlaying) doPlay(p.position); else doPause(p.position);
-            }, ['play', 'pause', 'seeked'], p.seq);
-          }
-        },
-        onStateChange: onYtStateChange,
-      },
-    });
-  } else {
-    try { ytPlayer.cueVideoById(videoId); } catch (e) {}
-  }
-}
-function onYtStateChange(e) {
-  if (e.data === YT.PlayerState.PLAYING) setPlayingUI(true);
-  else if (e.data === YT.PlayerState.PAUSED || e.data === YT.PlayerState.ENDED) setPlayingUI(false);
-  if (!socket) return;
-  if (e.data === YT.PlayerState.PLAYING) emitControl('play', 'play', ytPlayer.getCurrentTime());
-  else if (e.data === YT.PlayerState.PAUSED) emitControl('pause', 'pause', ytPlayer.getCurrentTime());
-  else if (e.data === YT.PlayerState.ENDED) emitEnded();
-}
-window.onYouTubeIframeAPIReady = () => { ytReady = true; };
-if (typeof YT !== 'undefined' && YT.loaded) ytReady = true;
-
-// soundcloud
-let scLoadToken = 0;
-function loadSoundCloud(url, attempt) {
-  attempt = attempt || 0;
-  const token = ++scLoadToken;
-  // Check the API BEFORE touching the iframe: the old code rebuilt the
-  // iframe on every retry, so a slow api.js reloaded the embed forever, and a
-  // retry left over from the previous track would replace the new one.
-  if (typeof SC === 'undefined' || !SC.Widget) {
-    if (attempt >= 100) { setStatus('ساندکلاد لود نشد — اینترنتت رو چک کن'); return; }
-    setTimeout(() => { if (token === scLoadToken) loadSoundCloud(url, attempt + 1); }, 300);
-    return;
-  }
-  scReady = false; scDuration = 0;
-  const src = 'https://w.soundcloud.com/player/?url=' + encodeURIComponent(url) +
-    '&auto_play=false&show_comments=false&visual=true';
-  scWrap.innerHTML = '<iframe id="scIframe" width="100%" height="166" scrolling="no" ' +
-    'frameborder="no" allow="autoplay" src="' + src + '"></iframe>';
-  scPlayer = SC.Widget(document.getElementById('scIframe'));
-  scPlayer.bind(SC.Widget.Events.READY, () => {
-    if (token !== scLoadToken) return; // a newer track already took over
-    scReady = true;
-    try { scPlayer.getDuration((ms) => { scDuration = (ms || 0) / 1000; }); } catch (e) {}
-    try { scPlayer.setVolume(volume); } catch (e) {}
-    if (pending) {
-      const p = pending; pending = null;
-      withSuppress(() => {
-        doSeek(p.position);
-        if (p.isPlaying) doPlay(p.position); else doPause(p.position);
-      }, ['play', 'pause', 'seeked'], p.seq);
-    }
-    scPlayer.bind(SC.Widget.Events.PLAY_PROGRESS, (ev) => { scLastPos = ev.currentPosition / 1000; });
-    scPlayer.bind(SC.Widget.Events.PLAY, () => {
-      scPlaying = true; setPlayingUI(true);
-      try { scPlayer.getDuration((ms) => { scDuration = (ms || 0) / 1000; }); } catch (e) {}
-      if (!socket) return;
-      const c = echo.resolve('play'); // decide now, the value arrives async
-      scPlayer.getPosition((ms) => { if (c.send) socket.emit('play', ms / 1000, c.seq); });
-    });
-    scPlayer.bind(SC.Widget.Events.PAUSE, () => {
-      const wasPlaying = scPlaying;
-      scPlaying = false; setPlayingUI(false);
-      if (!wasPlaying) return;
-      if (Date.now() - scActionAt < SC_ECHO_MS) return;
-      if (!socket) return;
-      const c = echo.resolve('pause');
-      scPlayer.getPosition((ms) => { if (c.send) socket.emit('pause', ms / 1000, c.seq); });
-    });
-    scPlayer.bind(SC.Widget.Events.FINISH, emitEnded);
-  });
-}
+// The media layer — players, echo handling and track loading — lives in
+// player.js, which loads after this file. See the note at the top of it
+// for why the order is what it is.
 
 // ============================================================ socket events
 function bindSocket(s) {
@@ -1051,6 +940,7 @@ function bindSocket(s) {
   s.on('room-flags', (f) => {
     if (!f) return;
     djOnly = !!f.djOnly;
+    if (f.queueSort) queueSort = f.queueSort === 'votes' ? 'votes' : 'added';
     // hostship itself comes from members (isHost flag) — never guess it
     paintMembers(lastMembers, djOnly);
   });
@@ -1060,7 +950,11 @@ function bindSocket(s) {
     if (d && d.code && d.token) saveHostToken(d.code, d.token);
   });
   s.on('kicked', (d) => {
-    if (d && d.code) { saveHostToken(d.code, null); saveOwnerSecret(d.code, null); }
+    if (d && d.code) {
+      saveHostToken(d.code, null);
+      saveOwnerSecret(d.code, null);
+      saveRoomPassword(d.code, null);
+    }
     resetRoomUI();
     history.replaceState(null, '', location.pathname);
     showOnly(lobby);
@@ -1071,6 +965,7 @@ let lastMembers = [];
 
 function applyFullState(st) {
   lastMembers = st.members || [];
+  queueSort = st.queueSort === 'votes' ? 'votes' : 'added';
   paintMembers(st.members, st.djOnly);
   applyRoomSpeed(st.speed || 1);
   paintQueue(st.queue);
@@ -1096,6 +991,7 @@ function autoRejoin() {
   socket.emit('join-room', code, {
     hostToken: getHostToken(code),
     ownerSecret: getOwnerSecret(code),
+    password: getRoomPassword(code),
   }, (res) => {
     if (!res || !res.ok) {
       const err = res && res.error;
