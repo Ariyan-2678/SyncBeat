@@ -105,6 +105,7 @@ npm start
 package.json      # وابستگی‌ها و اسکریپت‌ها (npm test)
 server.js         # سرور Express + Socket.IO و منطق هماهنگ‌سازی
 lib/
+  validate.js     # اعتبارسنجی ورودی و توکن‌ها (خالص، بدون وابستگی)
   store.js        # ذخیره‌سازی (SQLite از node:sqlite — بدون وابستگیِ نصبی)
 test/
   e2e.js          # تست خودکار (سرور تستی خودش را spawn می‌کنه)
@@ -115,5 +116,6 @@ public/
   index.html      # صفحه‌ی اصلی
   style.css       # استایل
   echo.js         # تشخیص اینکه رویدادِ پلیر از کاربره یا از دستورِ سرور
-  app.js          # منطق سمت کلاینت (پلیر و سوکت)
+  app.js          # نشست، سوکت و UI اتاق
+  player.js       # لایه‌ی پلیر (بعد از app.js لود می‌شه — توضیح بالای فایل)
 ```

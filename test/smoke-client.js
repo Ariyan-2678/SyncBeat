@@ -139,10 +139,15 @@ function loadClient(label, store) {
   sandbox.self = sandbox;
   sandbox.globalThis = sandbox;
 
-  const src = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  // Same order as index.html: app.js declares the DOM handles and the player
+  // state, player.js layers the media handling on top of them.
+  const files = ['app.js', 'player.js'];
   try {
     vm.createContext(sandbox);
-    vm.runInContext(src, sandbox, { filename: 'public/app.js' });
+    for (const f of files) {
+      const src = fs.readFileSync(path.join(__dirname, '..', 'public', f), 'utf8');
+      vm.runInContext(src, sandbox, { filename: 'public/' + f });
+    }
     vm.runInContext('socket = { emit: function () {}, on: function () {}, disconnect: function () {} };', sandbox);
     const problems = vm.runInContext(PROBES, sandbox, { filename: 'smoke-probes' });
     if (problems.length) {

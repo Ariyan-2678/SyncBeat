@@ -11,6 +11,17 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 
+// Input checking and the small secrets derived from it live apart — see
+// lib/validate.js. Everything here is pure, so keeping it in one place makes
+// it the part of the server you can reason about without the rest loaded.
+const V = require('./lib/validate');
+const {
+  avatarColor, validDisplayName, validGuestId, rid,
+  safePos, cleanTitle, cleanChat, UPLOAD_PATH_RE, makeTrackItem,
+  ownerTag, newOwnerSecret, adoptOwnerSecret,
+  cleanPassword, makePassword, passwordMatches, uploadExtOf,
+} = V;
+
 const app = express();
 const server = http.createServer(app);
 
@@ -127,44 +138,11 @@ function echoKind(room, seq) {
 // queue so everyone can see who added what, but only the holder of the secret
 // can delete the item. guestId cannot do this job — the client picks it, so
 // claiming someone else's is trivial (reproduced before this was added).
-const OWNER_SECRET_RE = /^[A-Za-z0-9_-]{24,64}$/;
-const ownerTag = (secret) =>
-  crypto.createHash('sha256').update(secret).digest('base64url').slice(0, 32);
-const newOwnerSecret = () => crypto.randomBytes(24).toString('base64url');
-function adoptOwnerSecret(v) {
-  return typeof v === 'string' && OWNER_SECRET_RE.test(v) ? v : newOwnerSecret();
-}
 
 // ---------------------------------------------------------- room password
 // Optional: a room with no password behaves exactly as before. Only the hash
 // and its per-room salt are stored and only a boolean is ever broadcast, so
 // the password itself never leaves the creator's browser.
-const PASSWORD_MAX = 64;
-function cleanPassword(p) {
-  if (typeof p !== 'string') return null;
-  const t = p.trim();
-  if (!t) return null;
-  return t.slice(0, PASSWORD_MAX);
-}
-function hashPassword(salt, password) {
-  // scrypt rather than a bare digest: this is a guessable secret, and join
-  // attempts are rate-limited but not free. Modest parameters — a room
-  // password is not a bank login, and every wrong guess costs ~10ms of CPU.
-  return crypto.scryptSync(password, salt, 32, { N: 4096, r: 8, p: 1 }).toString('base64url');
-}
-function makePassword(password) {
-  const salt = crypto.randomBytes(16).toString('base64url');
-  return { passwordSalt: salt, passwordHash: hashPassword(salt, password) };
-}
-function passwordMatches(room, password) {
-  if (!room.passwordHash) return true;
-  if (!password) return false;
-  const want = Buffer.from(room.passwordHash);
-  const got = Buffer.from(hashPassword(room.passwordSalt, password));
-  // timingSafeEqual throws on a length mismatch, and a stored hash from an
-  // older or corrupted row is not worth a crash over.
-  return want.length === got.length && crypto.timingSafeEqual(want, got);
-}
 
 // ---------------------------------------------------------- persistence
 const DATA_DIR = process.env.SB_DATA_DIR || path.join(__dirname, 'data');
@@ -205,26 +183,6 @@ function persistNow() {
 // ---------------------------------------------------------- guest identity
 // No passwords: the client sends { guestId, displayName }; the server
 // validates the shape and derives the avatar color from the name.
-function avatarColor(name) {
-  let h = 0;
-  for (let i = 0; i < String(name).length; i++) h = (h * 31 + String(name).charCodeAt(i)) >>> 0;
-  return 'hsl(' + (h % 360) + ' 45% 55%)';
-}
-function validDisplayName(name) {
-  if (typeof name !== 'string') return null;
-  const n = name.trim().replace(/\s+/g, ' ');
-  // 2..20 chars, letters (incl. Persian/Arabic range), digits, _ - .
-  if (!/^[\p{L}\p{N}_.\- ]{2,20}$/u.test(n)) return null;
-  return n;
-}
-function validGuestId(id) {
-  if (typeof id !== 'string') return null;
-  id = id.trim();
-  if (!/^[A-Za-z0-9_-]{6,32}$/.test(id)) return null;
-  return id;
-}
-const rid = () =>
-  Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
 // NOTE: there used to be a GET /api/room/:code here reporting whether a code
 // existed (and how many people were inside). Nothing ever called it, and it
@@ -238,32 +196,15 @@ const rid = () =>
 // unchanged because an upload is just another audio URL.
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch (e) { /* exists */ }
-const UPLOAD_EXT = new Set(['mp3', 'm4a', 'm4b', 'aac', 'ogg', 'oga', 'opus', 'wav', 'flac', 'weba']);
-const EXT_BY_MIME = {
-  'audio/mpeg': 'mp3', 'audio/mp3': 'mp3',
-  'audio/mp4': 'm4a', 'audio/x-m4a': 'm4a', 'audio/aac': 'aac',
-  'audio/ogg': 'ogg', 'audio/opus': 'opus', 'audio/webm': 'weba',
-  'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/flac': 'flac',
-};
+// The shape check lives in lib/validate.js; only the "is it actually on our
+// disk" half needs the filesystem, so it is injected here.
+const validTrackInput = (input) =>
+  V.validTrackInput(input, (name) => fs.existsSync(path.join(UPLOAD_DIR, name)));
 const MAX_UPLOAD_BYTES = parseInt(process.env.MAX_UPLOAD_MB || '30', 10) * 1024 * 1024;
 const MAX_UPLOAD_TOTAL = parseInt(process.env.MAX_UPLOAD_TOTAL_MB || '512', 10) * 1024 * 1024;
 const UPLOAD_TTL_MS = 24 * 3600 * 1000;
 // An upload is addressed as /uploads/<32 hex>.<ext>. Nothing else is ever
 // accepted, so the path cannot be walked out of the uploads directory.
-const UPLOAD_PATH_RE = /^\/uploads\/[a-f0-9]{32}\.[a-z0-9]{2,5}$/;
-
-function uploadExtOf(nameHeader, contentType) {
-  const type = String(contentType || '').toLowerCase().split(';')[0].trim();
-  let name = '';
-  try { name = decodeURIComponent(String(nameHeader || '')).trim(); } catch (e) { name = ''; }
-  // Browsers label .m4a / .oga inconsistently, so the extension wins when the
-  // content-type at least agrees this is audio.
-  if (type && type !== 'application/octet-stream' &&
-      type.indexOf('audio/') !== 0 && type !== 'video/mp4') return null;
-  const m = /\.([A-Za-z0-9]{2,5})$/.exec(name);
-  const fromName = m && UPLOAD_EXT.has(m[1].toLowerCase()) ? m[1].toLowerCase() : null;
-  return fromName || EXT_BY_MIME[type] || null;
-}
 
 // Range requests come free with express.static, so seeking works unchanged.
 app.use('/uploads', express.static(UPLOAD_DIR, { index: false, maxAge: '1h' }));
@@ -494,57 +435,7 @@ function touch(room) {
   room.lastActive = Date.now();
   markDirty(room.code);
 }
-
-const VALID_TRACK_TYPES = ['audio', 'youtube', 'soundcloud'];
 const VALID_EMOJI = ['❤️', '🔥', '👏', '😂', '😮', '👎', '🎵'];
-function safePos(p) {
-  return typeof p === 'number' && isFinite(p) && p >= 0 ? p : null;
-}
-function cleanTitle(t, fallback) {
-  if (typeof t === 'string') {
-    t = t.trim().slice(0, 140);
-    if (t) return t;
-  }
-  return fallback;
-}
-function cleanChat(text) {
-  if (typeof text !== 'string') return null;
-  const t = text.trim().replace(/\s+/g, ' ');
-  if (!t || t.length > 500) return null;
-  return t;
-}
-function validTrackInput(input) {
-  const raw = input || {};
-  const type = raw.type;
-  if (!VALID_TRACK_TYPES.includes(type) || typeof raw.url !== 'string') return null;
-  const url = raw.url.trim();
-  if (!url || url.length > 2048) return null;
-  if (type === 'youtube') {
-    if (!/^[\w-]{11}$/.test(url)) return null;
-  } else if (type === 'audio' && UPLOAD_PATH_RE.test(url)) {
-    // One of our own uploads. The path is fully server-generated so it cannot
-    // escape the uploads directory, but the file still has to be there.
-    if (!fs.existsSync(path.join(UPLOAD_DIR, url.slice(8)))) return null;
-  } else if (!/^https?:\/\//i.test(url)) return null;
-  return { type, url };
-}
-function makeTrackItem(input, title, user) {
-  return {
-    id: rid(),
-    type: input.type,
-    url: input.url,
-    title: cleanTitle(title, input.type === 'youtube' ? 'YouTube · ' + input.url : input.url.slice(0, 80)),
-    addedBy: {
-      userId: user.id,
-      guestId: user.guestId,
-      username: user.username,
-      ownerId: user.ownerTag, // hash — safe to broadcast, useless without the secret
-    },
-    addedAt: Date.now(),
-    votes: 0,
-    voters: [],
-  };
-}
 
 // Votes are advisory — the host still decides what plays — but a group needs
 // a way to say "this one next" without everyone shouting in chat.
