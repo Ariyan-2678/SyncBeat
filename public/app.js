@@ -21,7 +21,8 @@ const clearQueueBtn = $('clearQueueBtn'), sortBtn = $('sortBtn');
 const inviteBox = $('inviteBox'), inviteLink = $('inviteLink'), qrImg = $('qrImg');
 const trackUrl = $('trackUrl'), loadBtn = $('loadBtn');
 const uploadBtn = $('uploadBtn'), trackFile = $('trackFile');
-const emptyMsg = $('empty'), trackMeta = $('trackMeta'), trackTitle = $('trackTitle'), trackBy = $('trackBy');
+const emptyMsg = $('empty'), trackMeta = $('trackMeta'), trackTitle = $('trackTitle'), trackBy = $('trackBy'),
+  trackWarn = $('trackWarn');
 const audio = $('audio'), ytWrap = $('ytWrap'), scWrap = $('scWrap');
 const transport = $('transport'), playPauseBtn = $('playPauseBtn'), nextBtn = $('nextBtn');
 const seekBar = $('seekBar'), timeCur = $('timeCur'), timeDur = $('timeDur');
