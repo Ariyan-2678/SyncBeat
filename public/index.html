@@ -92,8 +92,11 @@
       <form id="joinForm" class="join-row" autocomplete="off">
         <input id="codeInput" maxlength="5" placeholder="کد اتاق" inputmode="text"
                autocapitalize="characters" spellcheck="false" autocomplete="off" aria-label="کد ۵ حرفی اتاق" />
+        <input id="roomPass" type="password" maxlength="64" placeholder="رمز اتاق (اختیاری)"
+               autocomplete="off" aria-label="رمز اتاق" />
         <button id="joinBtn" class="btn btn-lg" type="button">ورود به اتاق</button>
       </form>
+      <p class="join-hint">رمز اتاق اختیاریه: برای <b>ساختن</b> اتاقِ خصوصی همین‌جا بنویسش، و برای <b>ورود</b> به اتاقِ خصوصی هم همین‌جا.</p>
       <label class="check-row">
         <input id="listenerCheck" type="checkbox" />
         ورود به‌عنوان شنونده (فقط گوش + چت، بدون کنترل پخش)
@@ -114,6 +117,7 @@
         <div class="code-chip" title="این کد رو به دوستت بده">
           <span class="code-label">کد اتاق</span>
           <span id="roomCode" class="code latin">·····</span>
+          <span id="privateBadge" class="m-badge hidden" title="این اتاق رمز داره">🔒 خصوصی</span>
           <button id="copyBtn" class="chip-btn" type="button" title="کپی کد اتاق" aria-label="کپی کد اتاق">
             <span class="copy-label">کپی</span>
           </button>

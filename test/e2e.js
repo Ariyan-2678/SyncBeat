@@ -488,6 +488,46 @@ async function waitRunning(srv, label) {
   O2.emit('leave-room');
   await sleep(200);
 
+  // ---- optional room password ----
+  const Priv = client({ guestId: 'guestPw0015', displayName: 'Parisa' });
+  await once(Priv, 'connect');
+  const pc = await emitAck(Priv, 'create-room', { password: '  correct horse  ' });
+  if (!pc || !pc.ok) fail('private create: ' + JSON.stringify(pc));
+  const pcode = pc.code;
+  if (!pc.state || pc.state.private !== true) fail('a passworded room should report private: ' + JSON.stringify(pc.state && pc.state.private));
+  const serialised = JSON.stringify(pc.state || {});
+  if (serialised.indexOf('correct horse') !== -1 || (pc.state && pc.state.passwordHash)) {
+    fail('the room password or its hash leaked into the room state');
+  }
+
+  const NoPw = client({ guestId: 'guestPw0016', displayName: 'Nima' });
+  await once(NoPw, 'connect');
+  const empty = await emitAck(NoPw, 'join-room', pcode, {});
+  if (!empty || empty.ok !== false || empty.error !== 'wrong-password') {
+    fail('joining a private room without a password should be refused: ' + JSON.stringify(empty));
+  }
+  const wrong = await emitAck(NoPw, 'join-room', pcode, { password: 'incorrect horse' });
+  if (!wrong || wrong.ok !== false || wrong.error !== 'wrong-password') {
+    fail('a wrong password should be refused: ' + JSON.stringify(wrong));
+  }
+  const right = await emitAck(NoPw, 'join-room', pcode, { password: 'correct horse' });
+  if (!right || !right.ok) fail('the right password should get in: ' + JSON.stringify(right));
+
+  // an open room is unaffected
+  const Open = client({ guestId: 'guestPw0017', displayName: 'Omid' });
+  await once(Open, 'connect');
+  const openCreate = await emitAck(Open, 'create-room', {});
+  if (!openCreate || !openCreate.ok || !openCreate.state || openCreate.state.private !== false) {
+    fail('a room with no password should stay open: ' + JSON.stringify(openCreate.state && openCreate.state.private));
+  }
+  // ...and the host token still gets you in without re-typing it
+  const again = await emitAck(Priv, 'join-room', pcode, { hostToken: pc.hostToken });
+  if (!again || !again.ok || !again.isHost) fail('the host token should bypass the password: ' + JSON.stringify(again));
+
+  Priv.emit('leave-room'); NoPw.emit('leave-room'); Open.emit('leave-room');
+  await sleep(300);
+  ok('private rooms: password required, hash never broadcast, host token still wins');
+
   // ---- uploading a file instead of pasting a link ----
   const audioBytes = Buffer.concat([Buffer.from('ID3'), Buffer.alloc(512, 3)]);
   const up = await httpRequest('POST', '/api/upload',

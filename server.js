@@ -135,6 +135,37 @@ function adoptOwnerSecret(v) {
   return typeof v === 'string' && OWNER_SECRET_RE.test(v) ? v : newOwnerSecret();
 }
 
+// ---------------------------------------------------------- room password
+// Optional: a room with no password behaves exactly as before. Only the hash
+// and its per-room salt are stored and only a boolean is ever broadcast, so
+// the password itself never leaves the creator's browser.
+const PASSWORD_MAX = 64;
+function cleanPassword(p) {
+  if (typeof p !== 'string') return null;
+  const t = p.trim();
+  if (!t) return null;
+  return t.slice(0, PASSWORD_MAX);
+}
+function hashPassword(salt, password) {
+  // scrypt rather than a bare digest: this is a guessable secret, and join
+  // attempts are rate-limited but not free. Modest parameters — a room
+  // password is not a bank login, and every wrong guess costs ~10ms of CPU.
+  return crypto.scryptSync(password, salt, 32, { N: 4096, r: 8, p: 1 }).toString('base64url');
+}
+function makePassword(password) {
+  const salt = crypto.randomBytes(16).toString('base64url');
+  return { passwordSalt: salt, passwordHash: hashPassword(salt, password) };
+}
+function passwordMatches(room, password) {
+  if (!room.passwordHash) return true;
+  if (!password) return false;
+  const want = Buffer.from(room.passwordHash);
+  const got = Buffer.from(hashPassword(room.passwordSalt, password));
+  // timingSafeEqual throws on a length mismatch, and a stored hash from an
+  // older or corrupted row is not worth a crash over.
+  return want.length === got.length && crypto.timingSafeEqual(want, got);
+}
+
 // ---------------------------------------------------------- persistence
 const DATA_DIR = process.env.SB_DATA_DIR || path.join(__dirname, 'data');
 const store = require('./lib/store').open(DATA_DIR);
@@ -332,6 +363,8 @@ const rooms = {};
       isPlaying: false, // never resume playing after a restart
       position: typeof s.position === 'number' ? s.position : 0,
       seq: 0,
+      passwordHash: s.passwordHash || null,
+      passwordSalt: s.passwordSalt || null,
       updatedAt: Date.now(),
       updatedAtMono: monoNow(),
       createdAt: s.createdAt || Date.now(),
@@ -390,6 +423,8 @@ function roomState(room) {
     hostId: room.hostId,
     djOnly: !!room.djOnly,
     speed: VALID_SPEEDS.includes(room.speed) ? room.speed : 1,
+    // only a boolean: the hash never leaves the server
+    private: !!room.passwordHash,
     seq: room.seq || 0,
   };
 }
@@ -616,6 +651,9 @@ io.on('connection', (socket) => {
     const code = makeCode();
     // Secret host capability — returned ONLY to the creator here.
     const hostToken = crypto.randomBytes(24).toString('base64url');
+    // Optional: no password means an open room, exactly as before.
+    const pw = cleanPassword(opts && opts.password);
+    const locked = pw ? makePassword(pw) : { passwordSalt: null, passwordHash: null };
     rooms[code] = {
       code,
       hostId: null,
@@ -629,6 +667,8 @@ io.on('connection', (socket) => {
       isPlaying: false,
       position: 0,
       seq: 0,
+      passwordSalt: locked.passwordSalt,
+      passwordHash: locked.passwordHash,
       updatedAt: Date.now(),
       updatedAtMono: monoNow(),
       createdAt: Date.now(),
@@ -686,6 +726,12 @@ io.on('connection', (socket) => {
     const wantListener = !!(opts && opts.asListener);
     const token = opts && typeof opts.hostToken === 'string' ? opts.hostToken : null;
     const claimed = !!(token && room.hostToken && token === room.hostToken);
+    // A private room needs its password, unless you are proving hostship
+    // with the token — which the creator already holds.
+    if (!claimed && !passwordMatches(room, cleanPassword(opts && opts.password))) {
+      if (typeof cb === 'function') cb({ ok: false, error: 'wrong-password' });
+      return;
+    }
     // Re-adopt the queue-ownership secret this browser already holds, so a
     // refresh does not lose the right to delete its own queued tracks.
     if (opts && opts.ownerSecret !== undefined) {

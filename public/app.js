@@ -12,6 +12,7 @@ const userChip = $('userChip'), userAvatar = $('userAvatar'), userName = $('user
 const createBtn = $('createBtn'), joinBtn = $('joinBtn'), codeInput = $('codeInput');
 const listenerCheck = $('listenerCheck'), lobbyError = $('lobbyError');
 const roomCode = $('roomCode'), copyBtn = $('copyBtn'), shareBtn = $('shareBtn'), leaveBtn = $('leaveBtn');
+const roomPass = $('roomPass'), privateBadge = $('privateBadge');
 const userCount = $('userCount'), membersList = $('membersList');
 const djBadge = $('djBadge'), djRow = $('djRow'), djCheck = $('djCheck');
 const clearQueueBtn = $('clearQueueBtn');
@@ -75,6 +76,22 @@ function saveOwnerSecret(code, secret) {
   } catch (e) {}
 }
 let MY_OWNER_TAG = null;
+
+// Room passwords, kept so a reconnect (or a later visit to the invite link)
+// does not have to ask again. Same shape and lifetime as the host tokens.
+function roomPasswords() {
+  try { return JSON.parse(localStorage.getItem('sb-roompw') || '{}'); } catch (e) { return {}; }
+}
+function getRoomPassword(code) { return roomPasswords()[code] || ''; }
+function saveRoomPassword(code, pw) {
+  try {
+    const m = roomPasswords();
+    if (pw) m[code] = pw; else delete m[code];
+    const keys = Object.keys(m);
+    if (keys.length > 50) keys.slice(0, keys.length - 50).forEach((k) => delete m[k]);
+    localStorage.setItem('sb-roompw', JSON.stringify(m));
+  } catch (e) {}
+}
 
 function validNameLocal(n) {
   n = String(n == null ? '' : n).trim().replace(/\s+/g, ' ');
@@ -249,7 +266,7 @@ themeToggle.addEventListener('click', () => {
 createBtn.onclick = () => {
   if (!socket) return;
   lobbyError.textContent = '';
-  socket.emit('create-room', (res) => {
+  socket.emit('create-room', { password: roomPass.value }, (res) => {
     if (!res || !res.ok) {
       lobbyError.textContent =
         res && res.error === 'rate-limited' ? 'خیلی سریع می‌سازی — چند لحظه صبر کن'
@@ -273,12 +290,15 @@ function doJoin(code, asListener) {
     asListener: !!asListener,
     hostToken: getHostToken(code),
     ownerSecret: getOwnerSecret(code),
+    password: roomPass.value || getRoomPassword(code),
   }, (res) => {
     if (!res || !res.ok) {
       const err = res && res.error;
       lobbyError.textContent = err === 'banned' ? 'هاست تو رو از این اتاق بیرون کرده'
+        : err === 'wrong-password' ? 'رمز اتاق درست نیست'
         : err === 'rate-limited' ? 'خیلی سریع می‌ایی — چند لحظه صبر کن'
         : 'اتاقی با این کد پیدا نشد';
+      if (err === 'wrong-password') { try { roomPass.focus(); } catch (e) {} }
       return;
     }
     onEnteredRoom(res);
@@ -352,6 +372,8 @@ function onEnteredRoom(res) {
   MY_OWNER_TAG = res.ownerTag || null;
   myRole = res.role || 'member';
   amHost = !!res.isHost;
+  if (res.state && res.state.private) saveRoomPassword(res.code, roomPass.value || getRoomPassword(res.code));
+  privateBadge.classList.toggle('hidden', !(res.state && res.state.private));
   enterRoom(res.code);
   if (res.state) applyFullState(res.state);
   updateInvite();
@@ -387,6 +409,8 @@ function resetRoomUI() {
   queueCount.textContent = '0'; userCount.textContent = '1';
   inviteBox.classList.add('hidden');
   djBadge.classList.add('hidden');
+  privateBadge.classList.add('hidden');
+  roomPass.value = '';
   djRow.classList.add('hidden');
   clearQueueBtn.classList.add('hidden');
   djCheck.checked = false;
@@ -1060,7 +1084,11 @@ function bindSocket(s) {
     if (d && d.code && d.token) saveHostToken(d.code, d.token);
   });
   s.on('kicked', (d) => {
-    if (d && d.code) { saveHostToken(d.code, null); saveOwnerSecret(d.code, null); }
+    if (d && d.code) {
+      saveHostToken(d.code, null);
+      saveOwnerSecret(d.code, null);
+      saveRoomPassword(d.code, null);
+    }
     resetRoomUI();
     history.replaceState(null, '', location.pathname);
     showOnly(lobby);
@@ -1096,6 +1124,7 @@ function autoRejoin() {
   socket.emit('join-room', code, {
     hostToken: getHostToken(code),
     ownerSecret: getOwnerSecret(code),
+    password: getRoomPassword(code),
   }, (res) => {
     if (!res || !res.ok) {
       const err = res && res.error;
