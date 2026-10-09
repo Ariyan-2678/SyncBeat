@@ -54,8 +54,17 @@ let dataDir2 = null;
 const extraDataDirs = [];
 const openSockets = [];
 const extraServers = [];
+// Reconnection is left ON deliberately. With it off, a single refused
+// handshake — which happens on a loaded machine in the moment between a
+// child server binding its port and its event loop catching up — is fatal,
+// and the suite reports a timeout that is really a hiccup. Every assertion
+// here awaits an explicit connect or ack, so retrying only delays a genuine
+// failure rather than hiding one.
 function client(auth, opts, base) {
-  const s = io(base || BASE, { auth, reconnection: false, ...(opts || {}) });
+  const s = io(base || BASE, {
+    auth, reconnection: true, reconnectionDelay: 150, reconnectionDelayMax: 600,
+    reconnectionAttempts: 30, ...(opts || {}),
+  });
   openSockets.push(s);
   return s;
 }
@@ -82,11 +91,11 @@ function shutdown(code) {
 
 // A plain HTTP request that also hands back the body and headers — uploads
 // need to verify what actually comes back off the disk.
-function httpRequest(method, p, headers, body) {
+function httpRequest(method, p, headers, body, base) {
   return new Promise((res, rej) => {
     const h = Object.assign({}, headers);
     if (body) h['Content-Length'] = Buffer.byteLength(body);
-    const req = http.request(BASE + p, { method, headers: h }, (r) => {
+    const req = http.request((base || BASE) + p, { method, headers: h }, (r) => {
       const chunks = [];
       r.on('data', (c) => chunks.push(c));
       r.on('end', () => res({ status: r.statusCode, headers: r.headers, body: Buffer.concat(chunks) }));
@@ -665,8 +674,29 @@ async function waitRunning(srv, label) {
   // ---- rate limit keyed per forwarded client when TRUST_PROXY=1 ----
   // its own data dir: two processes must never race on the same rooms.json
   dataDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-test-proxy-'));
+  // A stand-in for the YouTube Data API so the search handler's own code —
+  // mapping, truncation, upstream failures — is exercised without a key.
+  const ytStub = http.createServer((req, res) => {
+    const u = new URL(req.url, 'http://x');
+    if (u.searchParams.get('q') === 'upstream-fail') {
+      res.writeHead(500); res.end('nope'); return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ items: [
+      { id: { videoId: 'dQw4w9WgXcQ' }, snippet: {
+        title: 'A & B <script>', channelTitle: 'Someone',
+        thumbnails: { default: { url: 'https://i.ytimg.com/vi/x/default.jpg' } } } },
+      { id: { playlistId: 'PLxx' }, snippet: { title: 'not a video', channelTitle: 'No' } },
+      { id: { videoId: 'abcdefghijk' }, snippet: {
+        title: 'x'.repeat(400), channelTitle: 'y'.repeat(200),
+        thumbnails: { default: { url: 'http://insecure.example/t.jpg' } } } },
+    ] }));
+  });
+  const stubPort = PORT + 3;
+  await new Promise((r) => ytStub.listen(stubPort, r));
   const proxySrv = startServer({
     PORT: String(PORT2), TRUST_PROXY: '1', SB_DATA_DIR: dataDir2, MAX_ROOMS: '2',
+    YOUTUBE_API_KEY: 'stub-key', YOUTUBE_API_BASE: 'http://localhost:' + stubPort,
   });
   extraServers.push(proxySrv);
   await waitRunning(proxySrv, 'TRUST_PROXY server');
@@ -693,6 +723,38 @@ async function waitRunning(srv, label) {
     fail('buckets are not isolated per forwarded client (leftmost entry was trusted?)');
   }
   ok('TRUST_PROXY=1 keys on the rightmost forwarded client, per-IP buckets isolated');
+
+  // ---- YouTube search ----
+  const searchAt = (base, q) =>
+    httpRequest('GET', '/api/search?q=' + encodeURIComponent(q), {}, null, base)
+      .then((r) => ({ status: r.status, body: JSON.parse(r.body.toString('utf8') || '{}') }));
+
+  const sr = await searchAt(pbase, 'some song');
+  if (sr.status !== 200 || !sr.body.ok) fail('search should succeed: ' + JSON.stringify(sr));
+  else {
+    const items = sr.body.results || [];
+    if (items.length !== 2) fail('non-video results should be dropped: ' + JSON.stringify(items.length));
+    if (items[0].id !== 'dQw4w9WgXcQ' || items[0].title !== 'A & B <script>') {
+      fail('first result mapped wrong: ' + JSON.stringify(items[0]));
+    }
+    if (items[1].title.length !== 140) fail('title should be capped at 140: ' + items[1].title.length);
+    if (items[1].channel.length !== 60) fail('channel should be capped at 60: ' + items[1].channel.length);
+    if (/^https:\/\//.test(items[1].thumb || '')) fail('a non-https thumbnail should be dropped: ' + items[1].thumb);
+  }
+  const srFail = await searchAt(pbase, 'upstream-fail');
+  if (srFail.status !== 502 || srFail.body.ok !== false) fail('an upstream failure should be a 502: ' + JSON.stringify(srFail));
+  const srEmpty = await searchAt(pbase, '   ');
+  if (srEmpty.status !== 200 || !srEmpty.body.ok || (srEmpty.body.results || []).length) {
+    fail('an empty query should short-circuit: ' + JSON.stringify(srEmpty));
+  }
+  const srForeign = await httpRequest('GET', '/api/search?q=x', { Origin: 'http://evil.example' }, null, pbase);
+  if (srForeign.status !== 403) fail('search should honour the origin gate: ' + srForeign.status);
+  const srNoKey = await searchAt(BASE, 'anything');
+  if (srNoKey.body.ok !== false || srNoKey.body.error !== 'no-key') {
+    fail('without a key the endpoint should say so: ' + JSON.stringify(srNoKey.body));
+  }
+  ok('YouTube search: maps, caps, drops non-videos, and is honest without a key');
+  ytStub.close();
 
   // ---- ceiling on live rooms (same server, fresh data dir => 0 rooms) ----
   const cap1 = await emitAck(PB, 'create-room', {});

@@ -153,6 +153,15 @@
                aria-label="انتخاب فایل صوتی" />
       </form>
 
+      <div id="searchBox" class="search-box">
+        <form id="searchForm" class="join-row" autocomplete="off">
+          <input id="searchInput" placeholder="جستجو در یوتیوب…" aria-label="جستجو در یوتیوب" />
+          <button id="searchBtn" class="chip-btn" type="button" title="جستجو">🔍</button>
+        </form>
+        <ul id="searchList" class="search-list hidden"></ul>
+        <p id="searchHint" class="join-hint hidden"></p>
+      </div>
+
       <div id="playerWrap" class="player-wrap">
         <div id="empty" class="empty">
           <div class="empty-art" aria-hidden="true">

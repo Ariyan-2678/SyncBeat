@@ -268,6 +268,52 @@ function uploadExtOf(nameHeader, contentType) {
 // Range requests come free with express.static, so seeking works unchanged.
 app.use('/uploads', express.static(UPLOAD_DIR, { index: false, maxAge: '1h' }));
 
+// ---------------------------------------------------------- YouTube search
+// Paste-a-link is the hard part of using this app: finding a URL that
+// actually plays is harder than finding the song. Search needs a key —
+// there is no supported no-key way to search YouTube — so the feature sits
+// behind YOUTUBE_API_KEY and says so rather than pretending.
+//
+// The search happens here, not in the browser: the key must not reach the
+// client, and it sidesteps CORS. Quota is ~100 units per query against a
+// free daily budget of 10,000.
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || '';
+// Overridable so the mapping can be tested against a stub instead of needing
+// a live key and burning quota.
+const YOUTUBE_API_BASE = process.env.YOUTUBE_API_BASE || 'https://www.googleapis.com';
+app.get('/api/search', async (req, res) => {
+  if (!originAllowed(req)) return res.status(403).json({ ok: false, error: 'origin' });
+  if (!YOUTUBE_API_KEY) return res.json({ ok: false, error: 'no-key' });
+  const q = String(req.query.q || '').trim().slice(0, 100);
+  if (!q) return res.json({ ok: true, results: [] });
+  const key = rateKeyOf({ headers: req.headers, address: req.socket.remoteAddress });
+  if (!rateOk('search:' + key, 30, 60000)) {
+    return res.status(429).json({ ok: false, error: 'rate-limited' });
+  }
+  const url = YOUTUBE_API_BASE + '/youtube/v3/search' +
+    '?part=snippet&type=video&videoCategoryId=10&maxResults=8' +
+    '&key=' + encodeURIComponent(YOUTUBE_API_KEY) +
+    '&q=' + encodeURIComponent(q);
+  let j;
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!r.ok) return res.status(502).json({ ok: false, error: 'upstream' });
+    j = await r.json();
+  } catch (e) {
+    return res.status(502).json({ ok: false, error: 'upstream' });
+  }
+  const results = (Array.isArray(j.items) ? j.items : [])
+    .filter((i) => i && i.id && i.id.videoId && i.snippet)
+    .map((i) => ({
+      id: i.id.videoId,
+      title: String(i.snippet.title || '').slice(0, 140),
+      channel: String(i.snippet.channelTitle || '').slice(0, 60),
+      thumb: i.snippet.thumbnails && i.snippet.thumbnails.default
+        ? i.snippet.thumbnails.default.url : null,
+    }));
+  res.json({ ok: true, results });
+});
+
 app.post('/api/upload',
   // Checks that must run before the body is buffered.
   (req, res, next) => {

@@ -13,6 +13,8 @@ const createBtn = $('createBtn'), joinBtn = $('joinBtn'), codeInput = $('codeInp
 const listenerCheck = $('listenerCheck'), lobbyError = $('lobbyError');
 const roomCode = $('roomCode'), copyBtn = $('copyBtn'), shareBtn = $('shareBtn'), leaveBtn = $('leaveBtn');
 const roomPass = $('roomPass'), privateBadge = $('privateBadge');
+const searchBox = $('searchBox'), searchForm = $('searchForm'), searchInput = $('searchInput'),
+  searchBtn = $('searchBtn'), searchList = $('searchList'), searchHint = $('searchHint');
 const userCount = $('userCount'), membersList = $('membersList');
 const djBadge = $('djBadge'), djRow = $('djRow'), djCheck = $('djCheck');
 const clearQueueBtn = $('clearQueueBtn'), sortBtn = $('sortBtn');
@@ -320,6 +322,75 @@ function doJoin(code, asListener) {
 joinForm.addEventListener('submit', (e) => { e.preventDefault(); joinBtn.click(); });
 trackForm.addEventListener('submit', (e) => { e.preventDefault(); loadBtn.click(); });
 
+// ============================================================ search YouTube
+// Paste-a-link is the hard part of using this app, so the link can be looked
+// up instead. The search is answered by our own server, which holds the API
+// key — the browser never sees it.
+let searchBusy = false;
+function runSearch() {
+  if (searchBusy) return;
+  const q = searchInput.value.trim();
+  if (!q) { searchList.classList.add('hidden'); return; }
+  searchBusy = true;
+  searchBtn.disabled = true;
+  searchHint.classList.add('hidden');
+  fetch('/api/search?q=' + encodeURIComponent(q))
+    .then((r) => r.json())
+    .then((res) => {
+      if (!res || !res.ok) {
+        showSearchHint(res && res.error === 'no-key'
+          ? 'جستجو خاموشه — متغیر YOUTUBE_API_KEY را روی سرور بذار.'
+          : res && res.error === 'rate-limited' ? 'خیلی سریع جستجو می‌کنی — کمی صبر کن'
+          : 'جستجو جواب نداد');
+        return;
+      }
+      paintSearch(res.results || []);
+    })
+    .catch(() => showSearchHint('جستجو جواب نداد'))
+    .finally(() => { searchBusy = false; searchBtn.disabled = false; });
+}
+function showSearchHint(msg) {
+  searchHint.textContent = msg;
+  searchHint.classList.remove('hidden');
+  searchList.classList.add('hidden');
+}
+function paintSearch(list) {
+  if (!list.length) { showSearchHint('چیزی پیدا نشد'); return; }
+  searchList.innerHTML = list.map((r) => {
+    // Only a real https thumbnail — an arbitrary scheme in an <img> src is
+    // not something to take on trust, even from our own upstream.
+    const thumb = /^https:\/\//.test(r.thumb || '') ? r.thumb : null;
+    return '<li class="s-item">' +
+      (thumb ? '<img class="s-thumb" src="' + esc(thumb) + '" alt="" loading="lazy" width="56" height="42" />' : '') +
+      '<span class="s-text">' +
+        '<span class="s-title">' + esc(r.title) + '</span>' +
+        '<span class="s-by">' + esc(r.channel || '') + '</span>' +
+      '</span>' +
+      '<button class="chip-btn s-add" type="button" data-id="' + esc(r.id) +
+      '" data-title="' + esc(r.title) + '">+ صف</button>' +
+      '</li>';
+  }).join('');
+  searchHint.classList.add('hidden');
+  searchList.classList.remove('hidden');
+}
+searchBtn.onclick = runSearch;
+searchForm.addEventListener('submit', (e) => { e.preventDefault(); runSearch(); });
+searchList.addEventListener('click', (e) => {
+  const b = e.target.closest('.s-add');
+  if (!b || !socket) return;
+  if (!canControlClient()) {
+    setStatus(myRole === 'listener' ? 'شنونده نمی‌تواند آهنگ اضافه کند 🎧' : 'فعلاً فقط DJ کنترل می‌کند');
+    return;
+  }
+  socket.emit('queue-add', {
+    type: 'youtube',
+    url: b.getAttribute('data-id'),
+    title: b.getAttribute('data-title'),
+  }, (res) => {
+    setStatus(res && res.ok ? 'به صف اضافه شد ✓' : 'خطا در افزودن');
+  });
+});
+
 // ============================================================ upload from disk
 // Links still work, but finding a host that permits hotlinking is a chore —
 // so the file can go straight to the server and be played back from there.
@@ -418,6 +489,8 @@ function resetRoomUI() {
   transport.classList.add('hidden');
   ytWrap.classList.add('hidden'); scWrap.classList.add('hidden');
   queueList.innerHTML = ''; historyList.innerHTML = ''; chatList.innerHTML = ''; membersList.innerHTML = '';
+  searchList.innerHTML = ''; searchList.classList.add('hidden'); searchHint.classList.add('hidden');
+  searchInput.value = '';
   historyBox.classList.add('hidden');
   queueCount.textContent = '0'; userCount.textContent = '1';
   inviteBox.classList.add('hidden');
@@ -638,6 +711,8 @@ function paintMembers(members, dj) {
   trackUrl.disabled = !canControlNow;
   loadBtn.disabled = !canControlNow;
   uploadBtn.disabled = !canControlNow;
+  searchBox.classList.toggle('hidden', !canControlNow);
+  if (!canControlNow) { searchList.classList.add('hidden'); searchHint.classList.add('hidden'); }
   djRow.classList.toggle('hidden', !amHost);
   clearQueueBtn.classList.toggle('hidden', !amHost);
   paintSortBtn();
